@@ -668,8 +668,8 @@ export function getTTSConfig() {
   let stored = {}
   try { stored = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.tts || {} } catch {}
   return {
-    ttsProvider:     stored.ttsProvider  || 'minimax',
-    ttsVoiceId:      stored.ttsVoiceId   || '',
+    ttsProvider:     stored.ttsProvider  || 'doubao',
+    ttsVoiceId:      stored.ttsVoiceId   || 'zh_female_xiaoxiaohe_uranus_bigtts',
     minimaxKey:      { configured: !!(stored.minimaxKey || process.env.MINIMAX_API_KEY || getMinimaxKey()) },
     doubaoKey:       { configured: !!(stored.doubaoKey) },
     doubaoAppId:     { configured: !!(stored.doubaoAppId), value: stored.doubaoAppId || '' },
@@ -688,8 +688,8 @@ export function getTTSCredentials() {
   let stored = {}
   try { stored = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.tts || {} } catch {}
   return {
-    provider:       stored.ttsProvider  || 'minimax',
-    voiceId:        stored.ttsVoiceId   || '',
+    provider:       stored.ttsProvider  || 'doubao',
+    voiceId:        stored.ttsVoiceId   || 'zh_female_xiaoxiaohe_uranus_bigtts',
     doubaoKey:      stored.doubaoKey    || process.env.DOUBAO_TTS_API_KEY || '',
     doubaoAppId:    stored.doubaoAppId  || process.env.DOUBAO_TTS_APP_ID || '',
     doubaoAccessKey: stored.doubaoAccessKey || process.env.DOUBAO_TTS_ACCESS_KEY || '',

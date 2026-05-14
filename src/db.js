@@ -228,6 +228,28 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_music_added  ON music_library(added_at);
   `)
 
+  // known_agents 表：记录启动时发现的本地 AI Agent
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS known_agents (
+      id                TEXT PRIMARY KEY,
+      name              TEXT NOT NULL,
+      description       TEXT NOT NULL DEFAULT '',
+      available         INTEGER NOT NULL DEFAULT 0,
+      version           TEXT,
+      invoke_type       TEXT,
+      invoke_cmd        TEXT,
+      invoke_args       TEXT NOT NULL DEFAULT '[]',
+      notes             TEXT NOT NULL DEFAULT '',
+      docs_url          TEXT,
+      docs_search_query TEXT,
+      detected_at       TEXT NOT NULL,
+      updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `)
+  // 老库迁移：补上文档字段
+  try { db.exec(`ALTER TABLE known_agents ADD COLUMN docs_url TEXT`) } catch {}
+  try { db.exec(`ALTER TABLE known_agents ADD COLUMN docs_search_query TEXT`) } catch {}
+
   // 重建 FTS 索引（覆盖已有数据，确保历史记忆也被索引）
   db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`)
 }
@@ -907,6 +929,15 @@ export function insertConversation({ role, from_id, to_id = null, content, times
     INSERT INTO conversations (role, from_id, to_id, content, timestamp, channel)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(role, fromId, toId, content, timestamp, channel || '')
+}
+
+// 将最近一条 jarvis 消息内容裁剪为已说出的部分（TTS 被打断时调用）
+export function updateLastJarvisConversationContent(spokenContent) {
+  const db = getDB()
+  const row = db.prepare(`SELECT id FROM conversations WHERE role = 'jarvis' ORDER BY id DESC LIMIT 1`).get()
+  if (!row) return false
+  db.prepare(`UPDATE conversations SET content = ? WHERE id = ?`).run(spokenContent, row.id)
+  return true
 }
 
 // 获取某个对话对象的最近 N 条消息（用户消息 + Jarvis 回复，按时序）

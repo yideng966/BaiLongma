@@ -401,6 +401,10 @@ const createSettingsModal = () => `
               <label class="settings-label" for="voice-auto-send">识别后自动发送</label>
               <input id="voice-auto-send" type="checkbox" checked style="width:auto;flex:none;">
             </div>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-auto-mic">启动时自动开启麦克风</label>
+              <input id="voice-auto-mic" type="checkbox" style="width:auto;flex:none;">
+            </div>
           </div>
 
           <div class="settings-section">

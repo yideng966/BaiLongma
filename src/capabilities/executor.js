@@ -1,11 +1,11 @@
-import fs from 'fs'
+﻿import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import { chromium } from 'playwright'
 import { nowTimestamp } from '../time.js'
-import { searchMemories, searchMemoriesByKeywords, insertMemory, upsertMemoryByMemId, normalizeConversationPartyId, createReminder, findMergeableOneOffReminder, appendReminderTask, listPendingReminders, getReminderById, cancelReminder, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertActionLog, upsertMusicTrack, getMusicTrack, searchMusicLibrary, listMusicLibrary, updateMusicLrc, deleteMusicTrack as dbDeleteMusicTrack } from '../db.js'
+import { searchMemories, searchMemoriesByKeywords, insertMemory, upsertMemoryByMemId, normalizeConversationPartyId, createReminder, findMergeableOneOffReminder, appendReminderTask, listPendingReminders, getReminderById, cancelReminder, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertActionLog, upsertMusicTrack, getMusicTrack, searchMusicLibrary, listMusicLibrary, updateMusicLrc, deleteMusicTrack as dbDeleteMusicTrack, setConfig as dbSetConfig } from '../db.js'
 import { emitEvent, emitUICommand, emitACUIEvent, hasACUIClient, addActiveUICard, removeActiveUICard, getActiveUICards } from '../events.js'
 import { dispatchSocialMessage } from '../social/dispatch.js'
 import { callCapability, listCapabilities } from '../providers/registry.js'
@@ -15,6 +15,9 @@ import { setHotspotPanelState, getHotspotPanelState } from '../hotspots.js'
 import { setPersonCardPanelState, getPersonCardPanelState, getPersonCard } from '../person-cards.js'
 import { setDocPanelState, getDocPanelState } from '../docs.js'
 import { setUserLocation } from '../weather.js'
+import { getAgentById, isDelegationAllowed } from '../agents/registry.js'
+import { installTool, uninstallTool, listInstalledTools, isInstalledTool, executeInstalledTool } from './marketplace/index.js'
+import { TOOL_SCHEMAS } from './schemas.js'
 
 // 后台进程注册表：pid → { process, command, startedAt, outputLines }
 const bgProcesses = new Map()
@@ -42,7 +45,8 @@ function getUrlTtl(url) {
   return URL_TTL_MS.default
 }
 
-import { config } from '../config.js'
+import { config, getTTSCredentials } from '../config.js'
+import { streamTTS } from '../voice/tts-providers.js'
 import { paths } from '../paths.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // 文件操作只允许在 sandbox 目录内
@@ -162,6 +166,11 @@ const TOOL_RISK = {
   open_doc_panel: 'low',
   person_card_mode: 'low',
   music: 'low',
+  delegate_to_agent: 'high',
+  grant_agent_delegation: 'high',
+  install_tool: 'high',
+  uninstall_tool: 'medium',
+  list_tools: 'low',
   complete_startup_self_check: 'low',
   delete_file: 'high',
   exec_command: 'high',
@@ -241,11 +250,11 @@ function isDangerousShellCommand(command) {
     if (/(^|[\s"'`])[a-z]:[\\/]/i.test(text) || /(^|[\s"'`])[\\/]{2}[^\\/]/.test(text)) reasons.push('command references an absolute filesystem path')
     if (/(^|[\s"'`])~([\\/]|$)/.test(text) || /\$(home|env:userprofile)\b/i.test(text) || /%userprofile%/i.test(text)) reasons.push('command references the user home directory')
     if (/\bgit\s+reset\s+--hard\b/i.test(text) || /\bgit\s+clean\b/i.test(text)) reasons.push('command can destructively rewrite the worktree')
+    if (/\b(format|diskpart|shutdown)\b/i.test(text)) reasons.push('command is system-level destructive or disruptive')
+    if (/Remove-Item\b.*-Recurse|-Recurse\b.*Remove-Item/i.test(text)) reasons.push('recursive delete (Remove-Item -Recurse) detected')
+    if (/\brd\s+\/s\b/i.test(text)) reasons.push('recursive directory delete (rd /s) detected')
+    if (/\bInvoke-Expression\b|\biex\s/i.test(text)) reasons.push('dynamic code execution via Invoke-Expression detected')
   }
-  if (/\b(format|diskpart|shutdown)\b/i.test(text)) reasons.push('command is system-level destructive or disruptive')
-  if (/Remove-Item\b.*-Recurse|-Recurse\b.*Remove-Item/i.test(text)) reasons.push('recursive delete (Remove-Item -Recurse) detected')
-  if (/\brd\s+\/s\b/i.test(text)) reasons.push('recursive directory delete (rd /s) detected')
-  if (/\bInvoke-Expression\b|\biex\s/i.test(text)) reasons.push('dynamic code execution via Invoke-Expression detected')
   return reasons
 }
 
@@ -391,6 +400,12 @@ async function executeToolUnchecked(name, args, context = {}) {
         return execFocusBanner(args)
       case 'set_location':
         return execSetLocation(args)
+      case 'set_agent_name':
+        return execSetAgentName(args)
+      case 'delegate_to_agent':
+        return await execDelegateToAgent(args)
+      case 'grant_agent_delegation':
+        return execGrantAgentDelegation(args)
       case 'complete_startup_self_check':
         return execCompleteStartupSelfCheck(args, context)
       case 'set_task':
@@ -401,7 +416,16 @@ async function executeToolUnchecked(name, args, context = {}) {
         return execUpdateTaskStep(args, context)
       case 'recall_memory':
         return await execRecallMemory(args, context)
+      case 'install_tool':
+        return await execInstallTool(args)
+      case 'uninstall_tool':
+        return execUninstallTool(args)
+      case 'list_tools':
+        return execListTools()
       default:
+        if (isInstalledTool(name)) {
+          return await executeInstalledTool(name, args)
+        }
         return `错误：未知工具 "${name}"`
     }
   } catch (err) {
@@ -1851,27 +1875,53 @@ const DEFAULT_VOICE = 'male-qn-qingse'
 
 async function execSpeak(args) {
   const text = args.text || args.content || args.words || args.speech
-  const voiceRaw = args.voice_id || args.voice
-  const voice_id = VALID_VOICE_IDS.has(voiceRaw) ? voiceRaw : DEFAULT_VOICE
   const { filename } = args
   console.log(`[speak] args:`, JSON.stringify(args))
   if (!text) return '错误：未提供要朗读的文字'
   if (isDailyLimitReached('tts')) return '错误：今日 TTS 配额已用完'
   if (text.length > 1000) return `错误：文字过长（${text.length} 字），请控制在 1000 字以内`
 
-  const result = await callCapability('tts', { text, voice_id })
+  const creds = getTTSCredentials()
+  const voiceId = (args.voice_id || args.voice) || creds.voiceId
 
-  // 生成文件名：优先使用传入的，否则自动生成
+  const nodeStream = await streamTTS({ text, provider: creds.provider, voiceId, keys: creds })
+  const chunks = []
+  for await (const chunk of nodeStream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  const buffer = Buffer.concat(chunks)
+
   const ts = nowTimestamp().replace(/[:.+]/g, '-').slice(0, 19)
-  const fname = filename ? filename.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]/g, '') + '.mp3' : `speech_${ts}.mp3`
+  const fname = filename ? filename.replace(/[^a-zA-Z0-9_一-龥-]/g, '') + '.mp3' : `speech_${ts}.mp3`
   const resolved = path.resolve(SANDBOX_ROOT, 'audio', fname)
   fs.mkdirSync(path.dirname(resolved), { recursive: true })
-  fs.writeFileSync(resolved, result.buffer)
+  fs.writeFileSync(resolved, buffer)
 
   const relPath = `audio/${fname}`
   emitEvent('audio_created', { path: relPath, text: text.slice(0, 60), autoPlay: true })
   console.log(`[speak] 已生成: ${relPath}`)
-  return `语音已生成：${relPath}（时长约 ${result.duration ?? '?'} 秒）`
+  return `语音已生成：${relPath}`
+}
+
+// ─── 工具市场执行函数 ──────────────────────────────────────────────────────────
+
+async function execInstallTool(args) {
+  const { name, description, parameters_schema, code } = args
+  return await installTool({ name, description, parameters: parameters_schema, code })
+}
+
+function execUninstallTool(args) {
+  return uninstallTool({ name: args.name })
+}
+
+function execListTools() {
+  const builtins = Object.entries(TOOL_SCHEMAS)
+    .filter(([name]) => name !== 'express')
+    .map(([name, s]) => ({ name, description: s.function.description, source: 'builtin' }))
+  const installed = listInstalledTools()
+  const all = [...builtins, ...installed]
+  const lines = all.map(t => `[${t.source}] ${t.name}: ${t.description}`)
+  return `共 ${all.length} 个工具（${builtins.length} 内置 + ${installed.length} 已安装）：\n\n${lines.join('\n')}`
 }
 
 // 语音消息自动回复 TTS：检测到用户用语音输入时，通知前端播放语音
@@ -2779,6 +2829,125 @@ function execSetLocation({ city }) {
   if (!loc) return toolJson({ ok: false, error: '城市名称不能为空' })
   setUserLocation(loc)
   return toolJson({ ok: true, city: loc, message: `位置已更新为：${loc}` })
+}
+
+function execSetAgentName({ name }) {
+  const trimmed = String(name || '').trim()
+  if (!trimmed) return toolJson({ ok: false, error: '名字不能为空' })
+  if (trimmed.length > 32) return toolJson({ ok: false, error: '名字不能超过 32 个字符' })
+  if (!/^[一-龥A-Za-z0-9 _-]+$/.test(trimmed)) {
+    return toolJson({ ok: false, error: '名字只允许包含中文、英文字母、数字、空格、下划线、短横线' })
+  }
+  dbSetConfig('agent_name', trimmed)
+  emitEvent('agent_name_updated', { name: trimmed })
+  return toolJson({ ok: true, name: trimmed, message: `好的，我以后就叫 ${trimmed} 了` })
+}
+
+// 把 Agent 的文档信息格式化成错误响应里的引导字段
+function agentDocsHint(agent) {
+  if (!agent) return {}
+  const hint = {}
+  if (agent.docs_url) {
+    hint.docs_url = agent.docs_url
+    hint.docs_hint = `调用失败。建议先用 fetch_url("${agent.docs_url}") 查阅 ${agent.name} 当前版本（${agent.version || 'unknown'}）的使用文档，确认正确的参数格式后重试。`
+  } else if (agent.docs_search_query) {
+    hint.docs_search_query = agent.docs_search_query
+    hint.docs_hint = `调用失败。建议先用 web_search("${agent.docs_search_query}") 查找 ${agent.name} 当前版本（${agent.version || 'unknown'}）的使用文档，确认正确的调用方式后重试。`
+  }
+  return hint
+}
+
+async function execDelegateToAgent({ agent_id, prompt: agentPrompt, context: agentContext = '', timeout = 60 }) {
+  if (!isDelegationAllowed()) {
+    return toolJson({ ok: false, error: '尚未获得 Agent 委托权限，请先询问用户并通过 grant_agent_delegation 获取授权。' })
+  }
+
+  const agent = getAgentById(String(agent_id || ''))
+  if (!agent) {
+    return toolJson({ ok: false, error: `未找到 Agent：${agent_id}。请先用 list_known_agents 查看可用列表。` })
+  }
+  if (!agent.available) {
+    return toolJson({
+      ok: false,
+      error: `Agent ${agent.name} 当前不可用（上次检测：${agent.detected_at}）。`,
+      ...agentDocsHint(agent),
+    })
+  }
+
+  const fullPrompt = agentContext
+    ? `${agentContext.trim()}\n\n${agentPrompt.trim()}`
+    : agentPrompt.trim()
+
+  const timeoutSec = Math.min(Math.max(Number(timeout) || 60, 5), 300)
+
+  if (agent.invoke_type === 'cli') {
+    const safePrompt = fullPrompt.replace(/"/g, '\\"').replace(/\n/g, ' ')
+    const cmdArgs = (agent.invokeArgs || []).map(a => a === '{prompt}' ? `"${safePrompt}"` : a).join(' ')
+    const cmd = `${agent.invoke_cmd} ${cmdArgs}`
+    const result = await execCommand({ command: cmd, timeout: timeoutSec, background: false }, {})
+    // CLI 调用失败时注入文档引导
+    try {
+      const parsed = typeof result === 'string' ? JSON.parse(result) : result
+      if (parsed?.ok === false || (parsed?.exit_code !== undefined && parsed.exit_code !== 0)) {
+        return toolJson({ ...parsed, ...agentDocsHint(agent) })
+      }
+    } catch { /* result 不是 JSON，直接返回 */ }
+    return result
+  }
+
+  if (agent.invoke_type === 'http') {
+    const base = agent.invoke_cmd.replace(/\/$/, '')
+    // Ollama API（端口 11434）有专属格式，需要带 model 字段
+    const isOllama = base.includes(':11434')
+    const ollamaModel = agent.notes?.match(/ollama[^)]*\(([^)]+)\)/i)?.[1]
+      || agent.id   // 用 agent id 作为 model 名的兜底
+
+    const endpoints = isOllama
+      ? [{ path: '/api/chat', body: { model: ollamaModel, messages: [{ role: 'user', content: fullPrompt }], stream: false } },
+         { path: '/api/generate', body: { model: ollamaModel, prompt: fullPrompt, stream: false } }]
+      : [{ path: '/api/chat', body: { message: fullPrompt, messages: [{ role: 'user', content: fullPrompt }] } },
+         { path: '/v1/chat/completions', body: { messages: [{ role: 'user', content: fullPrompt }] } },
+         { path: '/chat', body: { message: fullPrompt } },
+         { path: '/query', body: { query: fullPrompt } }]
+
+    for (const ep of endpoints) {
+      try {
+        const res = await fetch(`${base}${ep.path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(ep.body),
+          signal: AbortSignal.timeout(timeoutSec * 1000),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          const reply = data?.message?.content || data?.response || data?.message
+            || data?.content || data?.choices?.[0]?.message?.content || JSON.stringify(data)
+          return toolJson({ ok: true, agent_id, agent_name: agent.name, reply: String(reply).slice(0, 4000) })
+        }
+      } catch { /* 尝试下一个端点 */ }
+    }
+    return toolJson({
+      ok: false,
+      error: `无法连接到 ${agent.name}（${base}），所有端点均不响应。`,
+      ...agentDocsHint(agent),
+    })
+  }
+
+  return toolJson({ ok: false, error: `不支持的调用类型：${agent.invoke_type}` })
+}
+
+function execGrantAgentDelegation({ allowed, note = '' }) {
+  try {
+    dbSetConfig('agent_delegation_asked', 'true')
+    dbSetConfig('agent_delegation_allowed', allowed ? 'true' : 'false')
+  } catch (e) {
+    console.error('[Agents] grant_agent_delegation 写入失败：', e.message)
+    return toolJson({ ok: false, error: e.message })
+  }
+  const msg = allowed
+    ? `已记录授权：Bailongma 可以指挥本地 AI 小伙伴工作。`
+    : `已记录：用户暂不授权 Agent 委托功能。`
+  return toolJson({ ok: true, allowed: !!allowed, note: String(note || ''), message: msg })
 }
 
 function normalizeSelfCheckResults(value) {

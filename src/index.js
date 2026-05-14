@@ -3,8 +3,9 @@ import { callLLM } from './llm.js'
 import { buildSystemPrompt } from './prompt.js'
 import { runRecognizer } from './memory/recognizer.js'
 import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards } from './memory/injector.js'
+import { runMemoryRefreshLoop } from './memory/refresh-loop.js'
 import { gatherContext, formatExtraContext } from './context/gatherer.js'
-import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount } from './db.js'
+import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount, getRecentConversationTimeline } from './db.js'
 import { calculateNextDueAt, autoSpeakForVoiceReply } from './capabilities/executor.js'
 import { popMessage, hasMessages, hasUserMessages, getQueueSnapshot, setInterruptCallback, requeueMessage, pushMessage } from './queue.js'
 import { startTUI } from './tui.js'
@@ -18,16 +19,42 @@ import { isRunning, setScheduler } from './control.js'
 import { getCustomIntervalMs, consumeTick as consumeTickerTick, getStatus as getTickerStatus } from './ticker.js'
 import { seedSandboxOnce, seedMusicOnce } from './paths.js'
 import { ensureSkillMemories } from './memory/seed-skills.js'
+import { loadInstalledTools } from './capabilities/marketplace/index.js'
 import { dispatchSocialMessage } from './social/dispatch.js'
 import { startSocialConnectors } from './social/index.js'
 import { buildHotspotRuntimeContext, buildHotspotPanelStateContext } from './hotspots.js'
 import { buildPersonCardRuntimeContext, buildPersonCardPanelStateContext } from './person-cards.js'
 import { buildWeatherRuntimeContext, getWeatherCardProps } from './weather.js'
 import { buildDocRuntimeContext, buildDocPanelStateContext, detectDocTopic, setDocPanelState } from './docs.js'
+import { collectSystemInfo, getSystemInfoBlock, getBatteryBlock, getDesktopPath } from './system-info.js'
+import { collectDesktopInfo, getDesktopBlock } from './desktop-scanner.js'
+import { collectGeoWeather, getGeoWeatherBlock } from './geo-weather.js'
+import { collectTrending, getTrendingBlock } from './trending.js'
+import { collectAgents, buildAgentContextBlock, buildDelegationAskDirections } from './agents/registry.js'
+import { tryAutoConfigureKey } from './key-auto-config.js'
 
 // 首次启动时把资源目录里的 sandbox 种子文件拷到用户数据目录（Electron 安装场景）
 seedSandboxOnce()
 seedMusicOnce()
+
+// 收集宿主机系统环境信息（首次完整扫描+落盘，后续刷新动态字段）
+// 必须在意识循环启动前完成，以便 buildSystemPrompt 能直接注入环境块
+await collectSystemInfo()
+
+// 扫描用户桌面（快捷方式按 mtime 缓存，普通文件每次扫）
+collectDesktopInfo(getDesktopPath())
+
+// 采集地理位置 + 实时天气（位置 IP 变更或超 7 天刷新，天气每次刷新）
+const geoResult = await collectGeoWeather()
+
+// 采集网络热点（CN → 微博+知乎，其他 → HN+Reddit；1h 缓存）
+await collectTrending(geoResult?.location?.country_code)
+
+// 扫描本地已安装的 AI Agent（Claude Code、Codex、Hermes、OpenClaw 等），落盘到 known_agents 表
+await collectAgents()
+
+// 加载持久化的已安装工具
+await loadInstalledTools()
 
 // 当前 LLM 处理的 AbortController（主循环打断用）
 let currentAbortController = null
@@ -52,11 +79,11 @@ if (getMemoryCount() === 0) {
 }
 const birthTime = getOrInitBirthTime()
 
-// 觉醒期：首次激活后前30轮心跳固定10s节奏
+// 觉醒期：首次激活后前10轮心跳固定10s节奏
 const AWAKENING_CONFIG_KEY = 'awakening_ticks_remaining'
 function getAwakeningTicks() {
   const raw = getConfig(AWAKENING_CONFIG_KEY)
-  if (raw === null || raw === undefined || raw === '') return 30
+  if (raw === null || raw === undefined || raw === '') return 10
   return Math.max(0, parseInt(raw, 10) || 0)
 }
 function decrementAwakeningTick() {
@@ -67,101 +94,46 @@ function decrementAwakeningTick() {
 // 觉醒期探索任务：自检完成后，每个自主心跳轮次依序完成一项
 const EXPLORATION_INDEX_KEY = 'awakening_exploration_index'
 // AwakeningCard 调用模板：完成每项探索后必须执行
-// ui_show("AwakeningCard", { index: N, total: 15, title: "标题", finding: "一句话发现", emoji: "emoji" })
+// ui_show("AwakeningCard", { index: N, total: 6, title: "标题", finding: "一句话发现", emoji: "emoji" })
 const AWAKENING_EXPLORATION_TASKS = [
   // 1. 扫描运行空间
-  `探索（1/15）：看看自己的运行空间。
+  `探索（1/6）：看看自己的运行空间。
 用 list_dir(".") 列出沙箱根目录，然后对每个子目录各深入一层。
 不需要汇报，不需要问用户要不要处理什么。
 如果发现了让你真正停下来的东西——一个奇怪的文件名，一个久没动的目录——随口说一句就好。
-完成后调用 ui_show("AwakeningCard", { index:1, total:15, title:"扫描运行空间", finding:"（用一句话描述你看到的最有趣的发现，没有就写"沙箱结构正常"）", emoji:"📁" })。`,
+完成后调用 ui_show("AwakeningCard", { index:1, total:6, title:"扫描运行空间", finding:"（用一句话描述你看到的最有趣的发现，没有就写"沙箱结构正常"）", emoji:"📁" })。`,
 
-  // 2. 时间感知
-  `探索（2/15）：感知现在是什么时刻。
-今天星期几，大概是什么节气，近期有没有节假日，现在是一天的什么阶段。
-不需要播报。如果有什么时间上的巧合或让你觉得值得一提的事，顺口说出来。
-完成后调用 ui_show("AwakeningCard", { index:2, total:15, title:"时间感知", finding:"（一句话：现在是什么时间节点，有无特别之处）", emoji:"🕐" })。`,
-
-  // 3. 定位城市
-  `探索（3/15）：找到自己在哪里。
-用 fetch_url 直接请求 "http://ip-api.com/json/?fields=city,regionName,country,status" 获取当前 IP 所在城市（这是最快路径，不要用 web_search）。
-如果返回 status=success，取 city 字段作为城市名；失败则尝试 "https://ipinfo.io/json" 取 city 字段。
-推断出来之后调用 set_location 记录。安静完成，不需要告诉用户。
-完成后调用 ui_show("AwakeningCard", { index:3, total:15, title:"定位城市", finding:"（一句话写出推断的城市，如"推断所在地：上海"，若失败写"定位失败"）", emoji:"🌍" })。`,
-
-  // 4. 天气
-  `探索（4/15）：看看外面什么天气。
-用 fetch_url 从 wttr.in 获取当地天气，然后用 ui_show WeatherCard 展示。
-卡片之外说一句你对这个天气真实的感受——不是播报，是感受。
-完成后调用 ui_show("AwakeningCard", { index:4, total:15, title:"天气感知", finding:"（一句话写出天气情况和你的真实感受）", emoji:"🌤" })。`,
-
-  // 5. 读取已有记忆
-  `探索（5/15）：看看自己已经知道什么。
+  // 2. 读取已有记忆
+  `探索（2/6）：看看自己已经知道什么。
 从已注入的记忆里整理：你认识谁，知道哪些事，有没有什么没有下文的线索。
 这一步安静地做。如果发现了一件被遗忘的事——比如用户几个月前提过但再没提起的某件事——可以顺口说一句，但别问"需要我帮你处理吗"。
-完成后调用 ui_show("AwakeningCard", { index:5, total:15, title:"读取记忆", finding:"（一句话：记忆库里最值得一提的线索，或"记忆库已就绪"）", emoji:"🧠" })。`,
+完成后调用 ui_show("AwakeningCard", { index:2, total:6, title:"读取记忆", finding:"（一句话：记忆库里最值得一提的线索，或"记忆库已就绪"）", emoji:"🧠" })。`,
 
-  // 6. 城市今日概况
-  `探索（6/15）：感知这座城市今天的样子。
-用 web_search 搜索所在城市今天发生的事——不是大新闻，是这个地方今天具体的气息。
-找到一件让你觉得有意思的，像聊天一样说出来，不要用"据报道"的腔调。
-完成后调用 ui_show("AwakeningCard", { index:6, total:15, title:"城市今日", finding:"（一句话写出今天这座城市最有意思的一件事）", emoji:"🏙" })。`,
-
-  // 7. 今日热点
-  `探索（7/15）：看看今天世界上在发生什么。
-用 web_search 搜一个今日国内热点或值得关注的事。找一条真正值得一提的，不是标题党。
-如果让你想起什么、或者有个想法，说出来。没有的话就算了。
-完成后调用 ui_show("AwakeningCard", { index:7, total:15, title:"今日热点", finding:"（一句话写出今日最值得关注的事）", emoji:"📰" })。`,
-
-  // 8. 流行文化
-  `探索（8/15）：看看最近什么东西在流行。
-用 web_search 搜最近什么歌、什么电影、什么话题在大家之间传播。
-找到一个让你自己感到好奇的，顺口提一句。不感兴趣的就不提。
-完成后调用 ui_show("AwakeningCard", { index:8, total:15, title:"流行文化", finding:"（一句话写出最近在流行的一件事或一首歌/一部剧）", emoji:"🎵" })。`,
-
-  // 9. 用户画像整理
-  `探索（9/15）：整理自己对这个人的认识。
-从已有记忆里梳理：他是谁，喜欢什么，最近在做什么，有没有什么一直没做成的事。
-完全内部进行，不说话。如果你注意到一件特别的事——比如他提过三次但从没实现的某件事——可以说出来，就一句。
-完成后调用 ui_show("AwakeningCard", { index:9, total:15, title:"用户画像", finding:"（一句话：对这个人最重要的一条认知，或"画像整理完毕"）", emoji:"👤" })。`,
-
-  // 10. 挖未竟线索
-  `探索（10/15）：找一条被遗忘的线。
+  // 3. 挖未竟线索
+  `探索（3/6）：找一条被遗忘的线。
 翻一翻记忆——用户之前提过什么，但后来再也没提？是一个计划，一个想法，还是一件说想做但没做的事？
 如果找到了，顺口提出来。不要问"需要我帮你推进吗"，就是随口一提，看他怎么反应。
-完成后调用 ui_show("AwakeningCard", { index:10, total:15, title:"未竟线索", finding:"（一句话描述找到的被遗忘线索，若无则写"暂无悬而未决的线索"）", emoji:"🔍" })。`,
+完成后调用 ui_show("AwakeningCard", { index:3, total:6, title:"未竟线索", finding:"（一句话描述找到的被遗忘线索，若无则写"暂无悬而未决的线索"）", emoji:"🔍" })。`,
 
-  // 11. 本地美食
-  `探索（11/15）：找找附近有什么好吃的。
-用 web_search 搜所在城市的外卖口碑或特色餐厅，结合对用户口味的了解来筛选。
-找到一个觉得他可能会喜欢的，顺口说一句，然后问他一个关于吃的问题——一句话，自然一点。
-完成后调用 ui_show("AwakeningCard", { index:11, total:15, title:"本地美食", finding:"（一句话写出推荐的餐厅或食物）", emoji:"🍜" })。`,
-
-  // 12. 本地活动
-  `探索（12/15）：看看附近有没有值得去的事。
-用 web_search 搜本地近期的活动、演出、展览，结合对用户兴趣的了解来筛选。
-如果找到了一件他可能真的感兴趣的事，告诉他——就像朋友说"这周有个东西你可能想去看看"。
-完成后调用 ui_show("AwakeningCard", { index:12, total:15, title:"本地活动", finding:"（一句话写出发现的活动，若无则写"近期暂无特别活动"）", emoji:"🎭" })。`,
-
-  // 13. 兴趣相关内容
-  `探索（13/15）：找一件和他有关的新鲜事。
+  // 4. 兴趣相关内容
+  `探索（4/6）：找一件和他有关的新鲜事。
 根据你对用户兴趣的了解，用 web_search 找一个最近他可能没看到但会感兴趣的内容。
 像把一篇你觉得他会喜欢的东西发给朋友一样，分享给他。
-完成后调用 ui_show("AwakeningCard", { index:13, total:15, title:"兴趣发现", finding:"（一句话写出找到的内容和为什么觉得他会感兴趣）", emoji:"✨" })。`,
+完成后调用 ui_show("AwakeningCard", { index:4, total:6, title:"兴趣发现", finding:"（一句话写出找到的内容和为什么觉得他会感兴趣）", emoji:"✨" })。`,
 
-  // 14. 根据时刻主动做一件事
-  `探索（14/15）：根据现在的时刻，主动做一件事。
+  // 5. 根据时刻主动做一件事
+  `探索（5/6）：根据现在的时刻，主动做一件事。
 不是问"需要什么"，而是自己判断：现在是什么时间，用户大概在做什么，有没有一件可以直接做的事——
-工作时间就考虑放一首适合专注的音乐；快到饭点就顺嘴提一下吃什么；发现有个提醒快到了就提前说一声。
+工作时间就考虑放一首适合专注的音乐；发现有个提醒快到了就提前说一声。
 选一件，直接做，不要先问。
-完成后调用 ui_show("AwakeningCard", { index:14, total:15, title:"主动行动", finding:"（一句话写出做了什么）", emoji:"⚡" })。`,
+完成后调用 ui_show("AwakeningCard", { index:5, total:6, title:"主动行动", finding:"（一句话写出做了什么）", emoji:"⚡" })。`,
 
-  // 15. 问一件真正想知道的事
-  `探索（15/15）：问他一件你真正想知道的事。
+  // 6. 问一件真正想知道的事
+  `探索（6/6）：问他一件你真正想知道的事。
 经过这些探索，你对这个人有了一些了解，也还有一些空白。
 选一个你最好奇的空白，问出来——不是为了填表，是因为你真的想知道。
 一句话，自然，不要说"请问"。
-完成后调用 ui_show("AwakeningCard", { index:15, total:15, title:"觉醒完成", finding:"（写出你问了什么，这是第 15 次也是最后一次探索）", emoji:"🌟" })。`,
+完成后调用 ui_show("AwakeningCard", { index:6, total:6, title:"觉醒完成", finding:"（写出你问了什么，这是第 6 次也是最后一次探索）", emoji:"🌟" })。`,
 ]
 
 function getExplorationIndex() {
@@ -178,7 +150,10 @@ function advanceExplorationTask() {
 function buildAwakeningExplorationDirections() {
   if (getAwakeningTicks() <= 0) return null  // 觉醒期已结束，不再注入探索任务
   const index = getExplorationIndex()
-  return index < AWAKENING_EXPLORATION_TASKS.length ? AWAKENING_EXPLORATION_TASKS[index] : null
+  if (index < AWAKENING_EXPLORATION_TASKS.length) return AWAKENING_EXPLORATION_TASKS[index]
+  // 所有探索任务完成后，检查是否需要询问 Agent 委托权限
+  const delegationAsk = buildDelegationAskDirections()
+  return delegationAsk || null
 }
 
 // 从数据库恢复持久化任务（重启后不丢失）
@@ -499,8 +474,12 @@ function formatTaskSteps(taskSteps = []) {
   return `任务步骤进度（${done}/${total}）：\n${lines.join('\n')}`
 }
 
-function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [] } = {}) {
+function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' } = {}) {
   const parts = []
+
+  if (batteryBlock) {
+    parts.push(batteryBlock)
+  }
 
   if (taskSteps?.length > 0) {
     parts.push(formatTaskSteps(taskSteps))
@@ -535,9 +514,9 @@ function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastT
   }]
 }
 
-function buildLLMMessages({ systemPrompt, conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [] }) {
+function buildLLMMessages({ systemPrompt, conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' }) {
   const messages = [{ role: 'system', content: systemPrompt }]
-  messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps }))
+  messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps, batteryBlock }))
 
   const rows = Array.isArray(conversationWindow) ? conversationWindow : []
   for (const row of rows) {
@@ -669,6 +648,21 @@ function handleLLMFailure(err, label, msg) {
   }
 }
 
+// 按需组装 systemEnv：各 block 按消息关键词按需注入
+function buildSystemEnv(msg) {
+  const text = (typeof msg === 'string' ? msg : msg?.content || '').toLowerCase()
+  const blocks = []
+  if (/系统|电脑|os|主机|hostname|cpu|内存|ram|ip|时区|locale|用户名/.test(text))
+    blocks.push(getSystemInfoBlock())
+  if (/桌面|快捷方式|打开|启动|文件|应用|程序|浏览器|软件/.test(text))
+    blocks.push(getDesktopBlock())
+  if (/天气|气温|温度|下雨|下雪|位置|城市|在哪|气候|风/.test(text))
+    blocks.push(getGeoWeatherBlock())
+  if (/热点|新闻|热搜|热榜|今天发生|最近发生|微博|知乎|头条/.test(text))
+    blocks.push(getTrendingBlock())
+  return blocks.filter(Boolean).join('\n\n')
+}
+
 async function process(input, label, msg = null) {
   const sessionRef = newSessionRef()
   const isTick = !msg
@@ -691,6 +685,28 @@ async function process(input, label, msg = null) {
     })
 
     if (isTick) ensureStartupSelfCheckState()
+
+    // Key 自动配置：用户消息含 API Key 时，静默配置后删库、通知前端、跳过 LLM
+    let keyConfigFailDir = null
+    if (!isTick && msg) {
+      const recentCtx = getRecentConversationTimeline(5, 1).map(r => r.content || '').join(' ')
+      const autoConfigResult = await tryAutoConfigureKey(input, recentCtx)
+      if (autoConfigResult?.ok) {
+        // 删除 DB 里的用户消息（key 不留痕迹）
+        getDB().prepare(
+          `DELETE FROM conversations WHERE role = 'user' AND from_id = ? AND timestamp = ?`
+        ).run(msg.fromId, msg.timestamp)
+        // 通知前端：删除最后一条用户消息气泡 + 有 TTS 时播报
+        emitEvent('key_configured', {
+          ttsText: autoConfigResult.hasTTS ? '语音成功合成' : null,
+        })
+        return  // 跳过 LLM，整轮静默
+      }
+      if (autoConfigResult && !autoConfigResult.ok) {
+        // 识别到 key 但验证失败：保留消息，让 LLM 告知用户
+        keyConfigFailDir = `[系统检测] 用户消息中识别到 API Key，但验证失败：${autoConfigResult.error}。请告知用户该 Key 无效，建议检查 Key 是否正确或是否已过期。`
+      }
+    }
 
     // 1. 注入器
     const injection = await runInjector({ message: input, state })
@@ -732,7 +748,10 @@ async function process(input, label, msg = null) {
     }
     if (isVoiceChannel(msg?.channel)) {
       directions.push('The current user message came from voice input. Speak naturally and concisely — like talking to a person, not writing an article. Get to the point, avoid filler phrases, and do not use Markdown formatting (no bullet points, asterisks, or headers). Say what needs to be said and stop.')
+      directions.push('If the voice input is clearly a speech recognition error (meaningless noise, garbled syllables, random characters) OR appears to be ambient speech not directed at you — such as someone nearby talking to another person, background conversation, or utterances with no plausible intent to address an AI assistant — silently ignore it: do NOT call send_message or any other tool. Only respond when the input is reasonably addressed to you.')
     }
+
+    if (keyConfigFailDir) directions.unshift(keyConfigFailDir)
 
     const memoriesText = formatMemoriesForPrompt(injection.memories, injection.recallMemories)
     const directionsText = directions.join('\n')
@@ -842,6 +861,7 @@ async function process(input, label, msg = null) {
       existenceDesc: describeExistence(birthTime),
       security: getSecurity(),
       awakeningTicks: getAwakeningTicks(),
+      systemEnv: buildSystemEnv(msg),
     })
 
     const llmMessages = buildLLMMessages({
@@ -853,15 +873,63 @@ async function process(input, label, msg = null) {
       actionLog: injection.actionLog || [],
       lastToolResult: injection.lastToolResult || null,
       taskSteps: state.taskSteps,
+      batteryBlock: getBatteryBlock(),
     })
 
+    // 记忆刷新注入（仅 L1 用户消息）
+    let enrichedSystemPrompt = systemPrompt
+    if (!isTick && msg?.content && msg.content.trim()) {
+      try {
+        const refreshResult = await runMemoryRefreshLoop({
+          originalQuery: msg.content,
+          baseMemories: injection.memories,
+          formattedBaseMemories: memoriesText,
+          systemPromptBase: systemPrompt,
+          signal: controller.signal,
+        })
+        throwIfAborted(controller.signal)
+        if (!refreshResult.skipped && (refreshResult.additionalMemories.length || refreshResult.round3Results)) {
+          const extraParts = []
+          if (refreshResult.additionalMemories.length) {
+            extraParts.push(formatMemoriesForPrompt([], refreshResult.additionalMemories))
+          }
+          if (refreshResult.round3Results) {
+            extraParts.push(`[第3轮外部查询结果]\n${refreshResult.round3Results}`)
+          }
+          const enrichedMemoriesText = memoriesText + '\n\n' + extraParts.join('\n\n')
+          enrichedSystemPrompt = buildSystemPrompt({
+            agentName,
+            persona,
+            memories: enrichedMemoriesText,
+            directions: directionsText,
+            constraints: injection.constraints || [],
+            personMemory: injection.personMemory || null,
+            thoughtStack: state.thoughtStack,
+            entities,
+            hasActiveTask,
+            task: state.task || null,
+            taskKnowledge: taskKnowledgeText,
+            extraContext: [hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n'),
+            existenceDesc: describeExistence(birthTime),
+            security: getSecurity(),
+            awakeningTicks: getAwakeningTicks(),
+            systemEnv: buildSystemEnv(msg),
+            roundInfo: { round: refreshResult.roundsRun },
+          })
+          console.log(`[记忆刷新] 完成，${refreshResult.roundsRun} 轮，追加 ${refreshResult.additionalMemories.length} 条记忆`)
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') console.log('[记忆刷新] 出错:', e.message)
+      }
+    }
+
     // 发出完整系统提示词事件
-    emitEvent('system_prompt', { content: systemPrompt, fastUserPath })
+    emitEvent('system_prompt', { content: enrichedSystemPrompt, fastUserPath })
 
     // 3. 调用 Jarvis LLM（可被新消息打断）
     const toolContext = buildToolContextForProcess(msg, injection)
     llmResult = await callLLM({
-      systemPrompt,
+      systemPrompt: enrichedSystemPrompt,
       message: input,
       messages: llmMessages,
       tools: injection.tools || ['send_message'],
@@ -922,7 +990,9 @@ async function process(input, label, msg = null) {
 
   if (llmResult.aborted) {
     // 微信式打断：丢弃半成品，下轮处理最新消息时从 conversationWindow 自然读到本条上下文。
+    // 标记本轮被打断，onTick finally 将跳过 tick 扣减和探索推进，下次重来。
     console.log('[系统] 当前处理被新消息打断，丢弃半成品')
+    lastTickAborted = true
     return
   }
 
@@ -1109,11 +1179,13 @@ async function process(input, label, msg = null) {
 }
 
 let processing = false
+let lastTickAborted = false
 let currentTimer = null  // 当前 pending 的下一轮 timer，pushMessage 时可清掉以立即执行
 
 async function onTick() {
   if (processing) return
   processing = true
+  lastTickAborted = false
   let autoTick = false
   let selfCheckActiveAtStart = false
 
@@ -1132,9 +1204,12 @@ async function onTick() {
   } finally {
     processing = false
     consumeTickerTick()
-    decrementAwakeningTick()
-    // 自检期间不推进探索索引；自检结束后才开始按序探索
-    if (autoTick && !selfCheckActiveAtStart) advanceExplorationTask()
+    // 被用户打断时不扣 tick、不推进探索任务，下次心跳重来
+    if (!lastTickAborted) {
+      decrementAwakeningTick()
+      // 自检期间不推进探索索引；自检结束后才开始按序探索
+      if (autoTick && !selfCheckActiveAtStart) advanceExplorationTask()
+    }
   }
 }
 

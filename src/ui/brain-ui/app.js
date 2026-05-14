@@ -47,6 +47,7 @@ let chat = null;
 
 function addMsg(...args) { return chat?.addMsg(...args); }
 function openChat(...args) { return chat?.openChat(...args); }
+function updateLastJarvisMsg(...args) { return chat?.updateLastJarvisMsg(...args); }
 function isTyping() { return chat?.isTyping() || false; }
 
 function defaultInputPlaceholder() {
@@ -1209,6 +1210,7 @@ function handle({ type, data = {} }) {
       break;
     case "message":
       if (data.from === "consciousness") {
+        lastJarvisContent = data.content;
         addMsg("jarvis", data.content);
         updatePersonCardFromAssistantText(data.content);
         openChat(true);
@@ -1247,6 +1249,10 @@ function handle({ type, data = {} }) {
       break;
     case "tts_reply":
       if (data.text) playTTSReply(data.text);
+      break;
+    case "key_configured":
+      chat.deleteLastUserMsg();
+      if (data.service === 'tts' && data.ttsText) playTTSReply(data.ttsText);
       break;
     case "startup_self_check_started":
       playJarvisStartupSound();
@@ -1325,16 +1331,119 @@ function playJarvisStartupSound() {
 
 // ── TTS 语音回复播放 ──────────────────────────────────────────────────────────
 let ttsAudioEl = null;
+let ttsCurrentText = '';          // 当前正在播放的完整文本（TTS 清理后的纯文本）
+let ttsInterruptedRemaining = ''; // 被打断时剩余未播放的文本
+let lastJarvisContent = '';       // 最近一条 jarvis 消息的原始内容（含 markdown）
+let ttsInterruptedOriginalContent = ''; // 打断时保存的原始消息，用于误触发恢复
+let ttsInterruptionApplied = false;     // 是否已将打断标记应用到聊天界面
+let ttsInterruptionDbTimer = null;      // 延迟提交 DB 更新的计时器（误触发时取消）
 
-// 供 voice-panel 打断检测调用：停止当前 TTS 播放（不恢复 ASR，由调用方负责）
+// 从音频播放进度估算已播放文本的字符数，找到合适的断句点
+// 返回 { remaining: 未播放文本, spokenUpTo: 已播放到的字符位置 }
+function calcRemainingText(text, currentTime, duration) {
+  if (!text || !duration || duration <= 0) return { remaining: '', spokenUpTo: 0 };
+  const progress = Math.min(1, currentTime / duration);
+  const spokenChars = Math.floor(text.length * progress);
+  const BOUNDARIES = /[。！？，.!?,\n]/g;
+  let bestPos = spokenChars;
+  let match;
+  BOUNDARIES.lastIndex = Math.max(0, spokenChars - 10);
+  while ((match = BOUNDARIES.exec(text)) !== null) {
+    if (match.index >= spokenChars) {
+      bestPos = match.index + 1;
+      break;
+    }
+  }
+  return { remaining: text.slice(bestPos).trim(), spokenUpTo: bestPos };
+}
+
+// 根据 TTS 纯文本中的说话比例，估算原始 markdown 中的截断位置
+function findMarkdownCutPos(markdown, ttsFullLen, ttsSpokenUpTo) {
+  if (!markdown || ttsFullLen <= 0) return 0;
+  const ratio = ttsSpokenUpTo / ttsFullLen;
+  const approxPos = Math.floor(markdown.length * ratio);
+  const BOUNDARIES = /[。！？\n.!?]/g;
+  let bestPos = approxPos;
+  BOUNDARIES.lastIndex = Math.max(0, approxPos - 15);
+  let match;
+  while ((match = BOUNDARIES.exec(markdown)) !== null) {
+    if (match.index >= approxPos) { bestPos = match.index + 1; break; }
+  }
+  return bestPos;
+}
+
+// 将打断标记应用到聊天界面，并延迟提交 DB 更新（3.5s 内误触发则撤销）
+function applyTTSInterruption(spokenUpTo) {
+  const originalContent = lastJarvisContent || ttsCurrentText;
+  if (!originalContent) return;
+  ttsInterruptedOriginalContent = originalContent;
+  ttsInterruptionApplied = true;
+
+  const cutPos = findMarkdownCutPos(originalContent, ttsCurrentText.length, spokenUpTo);
+  const spokenMarkdown = originalContent.slice(0, cutPos).trimEnd();
+  const displayText = spokenMarkdown ? spokenMarkdown + ' ✋' : '✋';
+  const dbContent = spokenMarkdown || '✋';
+
+  updateLastJarvisMsg(displayText);
+
+  // 延迟写 DB：若随后判定为误触发（resumeTTSIfNoSpeech），计时器会被取消
+  if (ttsInterruptionDbTimer) clearTimeout(ttsInterruptionDbTimer);
+  ttsInterruptionDbTimer = setTimeout(() => {
+    ttsInterruptionDbTimer = null;
+    fetch(`${API}/tts/interrupted`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spokenContent: dbContent }),
+    }).catch(() => {});
+  }, 4000);
+}
+
+// 供 voice-panel 打断检测调用：停止当前 TTS 播放，记录打断位置
 window.stopTTS = () => {
   if (!ttsAudioEl) return;
+  const { remaining, spokenUpTo } = calcRemainingText(
+    ttsCurrentText,
+    ttsAudioEl.currentTime,
+    ttsAudioEl.duration,
+  );
+  // duration 未加载时（NaN）spokenUpTo=0，remaining=''，fallback 到完整文本
+  ttsInterruptedRemaining = remaining || ttsCurrentText;
+  applyTTSInterruption(spokenUpTo);
   ttsAudioEl.pause();
   try { URL.revokeObjectURL(ttsAudioEl.src); } catch {}
   ttsAudioEl = null;
 };
 
+// 供 voice-panel 在检测到冲击噪音时调用：降低 TTS 音量但不停止
+window.duckTTS = () => {
+  if (ttsAudioEl) ttsAudioEl.volume = 0.15;
+};
+
+// 供 voice-panel 在判定为噪音后调用：恢复原音量
+window.unduckTTS = () => {
+  if (ttsAudioEl) ttsAudioEl.volume = 1.0;
+};
+
+// 供 voice-panel 在"噪音误触发"时调用：从打断处继续播放，并恢复聊天记录
+window.resumeTTSIfNoSpeech = () => {
+  const text = ttsInterruptedRemaining;
+  ttsInterruptedRemaining = '';
+  if (!text) return;
+  // 取消 DB 更新并还原聊天界面
+  if (ttsInterruptionDbTimer) { clearTimeout(ttsInterruptionDbTimer); ttsInterruptionDbTimer = null; }
+  if (ttsInterruptionApplied && ttsInterruptedOriginalContent) {
+    updateLastJarvisMsg(ttsInterruptedOriginalContent);
+  }
+  ttsInterruptionApplied = false;
+  ttsInterruptedOriginalContent = '';
+  playTTSReply(text);
+};
+
 async function playTTSReply(text) {
+  ttsCurrentText = text;
+  ttsInterruptedRemaining = '';
+  ttsInterruptionApplied = false;
+  ttsInterruptedOriginalContent = '';
   try {
     const resp = await fetch(`${API}/tts/stream`, {
       method: "POST",
@@ -1350,21 +1459,25 @@ async function playTTSReply(text) {
     const url = URL.createObjectURL(blob);
     if (ttsAudioEl) { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); }
     ttsAudioEl = new Audio(url);
+    ttsAudioEl.volume = 1.0; // 确保从满音量开始（避免上一次 duck 状态残留）
     // 停掉云端 ASR，但保持 mic 硬件开着以便打断检测
     window.bailongmaVoice?.suspendForTTS?.();
     ttsAudioEl.onended = () => {
       URL.revokeObjectURL(url);
       ttsAudioEl = null;
+      ttsCurrentText = '';
       window.bailongmaVoice?.resumeAfterMedia();
     };
     ttsAudioEl.onerror = () => {
       ttsAudioEl = null;
+      ttsCurrentText = '';
       window.bailongmaVoice?.resumeAfterMedia();
     };
     ttsAudioEl.play().catch(() => {
       window.bailongmaVoice?.resumeAfterMedia();
     });
   } catch {
+    ttsCurrentText = '';
     window.bailongmaVoice?.resumeAfterMedia();
   }
 }
@@ -1491,8 +1604,9 @@ function initTTSSettings() {
   // 加载现有配置 + 声音列表
   fetch(`${API}/settings/tts`).then(r => r.json()).then(({ tts, voices }) => {
     if (voices) allVoices = voices;
-    const provider = tts?.ttsProvider || "minimax";
+    const provider = tts?.ttsProvider || "doubao";
     if (tts?.ttsProvider) providerSel.value = tts.ttsProvider;
+    else providerSel.value = "doubao";
     updateVoiceOptions(provider, tts?.ttsVoiceId);
     const appidEl = document.getElementById("tts-volcano-appid");
     if (appidEl && tts?.volcanoAppId?.value) appidEl.value = tts.volcanoAppId.value;
@@ -1566,9 +1680,29 @@ function initTTSSettings() {
           body: JSON.stringify(preBody),
         });
         if (testStatus) testStatus.textContent = "合成中…";
-        await playTTSReply("你好，这是语音合成测试，声音是否清晰自然？");
+        const ttsResp = await fetch(`${API}/tts/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: "你好，这是语音合成测试，声音是否清晰自然？" }),
+        });
+        if (!ttsResp.ok) {
+          let errMsg = `合成失败 (HTTP ${ttsResp.status})`;
+          try { const j = await ttsResp.json(); errMsg = j.error || errMsg; } catch {}
+          if (testStatus) testStatus.textContent = errMsg;
+          return;
+        }
+        const ttsBlob = await ttsResp.blob();
+        if (ttsBlob.size === 0) {
+          if (testStatus) testStatus.textContent = "合成失败：API 返回空数据，请检查 Key 和账户配置";
+          return;
+        }
+        const ttsUrl = URL.createObjectURL(ttsBlob);
+        const ttsAudio = new Audio(ttsUrl);
+        ttsAudio.onended = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = ""; };
+        ttsAudio.onerror = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = "播放失败"; };
+        await ttsAudio.play();
         if (testStatus) testStatus.textContent = "播放中";
-        setTimeout(() => { if (testStatus) testStatus.textContent = ""; }, 4000);
+        setTimeout(() => { if (testStatus && testStatus.textContent === "播放中") testStatus.textContent = ""; }, 8000);
       } catch {
         if (testStatus) testStatus.textContent = "失败，请检查配置和 API Key";
       } finally {
@@ -1859,6 +1993,7 @@ window.addEventListener("beforeunload", () => {
   // ── 语音设置持久化 ──
   const VOICE_LANG_KEY       = "bailongma-voice-lang";
   const VOICE_AUTO_SEND_KEY  = "bailongma-voice-auto-send";
+  const VOICE_AUTO_MIC_KEY   = "bailongma-voice-auto-mic";
   const VOICE_THRESHOLD_KEY  = "bailongma-voice-threshold";
   const VOICE_PROVIDER_KEY   = "bailongma-voice-provider";
 
@@ -1880,6 +2015,8 @@ window.addEventListener("beforeunload", () => {
     const autoSend   = document.getElementById("voice-auto-send");
     if (langSelect) langSelect.value = localStorage.getItem(VOICE_LANG_KEY) || "zh-CN";
     if (autoSend) autoSend.checked = localStorage.getItem(VOICE_AUTO_SEND_KEY) !== "false";
+    const autoMic = document.getElementById("voice-auto-mic");
+    if (autoMic) autoMic.checked = localStorage.getItem(VOICE_AUTO_MIC_KEY) === "true";
     const savedThresh = parseFloat(localStorage.getItem(VOICE_THRESHOLD_KEY) || "0.008");
     if (voiceThreshSlider) voiceThreshSlider.value = String(savedThresh);
     if (voiceThreshVal)    voiceThreshVal.textContent = savedThresh.toFixed(3);
@@ -1900,11 +2037,13 @@ window.addEventListener("beforeunload", () => {
     saveVoiceBtn.addEventListener("click", async () => {
       const lang      = document.getElementById("voice-lang-select")?.value || "zh-CN";
       const autoSend  = document.getElementById("voice-auto-send")?.checked ?? true;
+      const autoMic   = document.getElementById("voice-auto-mic")?.checked ?? false;
       const threshold = parseFloat(voiceThreshSlider?.value ?? "0.008");
       const provider  = voiceProviderSelect?.value || "aliyun";
 
       localStorage.setItem(VOICE_LANG_KEY,      lang);
       localStorage.setItem(VOICE_AUTO_SEND_KEY,  String(autoSend));
+      localStorage.setItem(VOICE_AUTO_MIC_KEY,   String(autoMic));
       localStorage.setItem(VOICE_THRESHOLD_KEY,  String(threshold));
       localStorage.setItem(VOICE_PROVIDER_KEY,   provider);
 
@@ -2197,6 +2336,7 @@ initVoicePanel({
   getSendMessage: (options) => chat?.send?.(options),
   getLang:       () => localStorage.getItem("bailongma-voice-lang") || "zh-CN",
   getAutoSend:   () => localStorage.getItem("bailongma-voice-auto-send") !== "false",
+  getAutoMic:    () => localStorage.getItem("bailongma-voice-auto-mic") === "true",
 });
 
 // ── Hotspot mode ──

@@ -12,6 +12,7 @@ import {
   markUISignalsConsumed,
 } from '../db.js'
 import { getActiveUICards } from '../events.js'
+import { getInstalledToolNames } from '../capabilities/marketplace/index.js'
 
 const L2_CONTEXT_HOURS = 24 * 7
 const PRIMARY_USER_ID = 'ID:000001'
@@ -208,7 +209,8 @@ export async function runInjector({ message, state, hint = '' }) {
     'send_message', 'web_search', 'fetch_url', 'browser_read', 'list_dir', 'read_file', 'write_file',
     'delete_file', 'make_dir', 'exec_command', 'kill_process', 'list_processes',
     'set_tick_interval', 'media_mode', 'hotspot_mode', 'person_card_mode', 'manage_reminder', 'manage_prefetch_task',
-    'recall_memory', 'set_task', 'music', 'manage_app', 'ui_patch', 'focus_banner', 'set_location',
+    'recall_memory', 'set_task', 'music', 'manage_app', 'ui_patch', 'focus_banner', 'set_location', 'set_agent_name',
+    'install_tool', 'uninstall_tool', 'list_tools',
   ]
   if (hasTask) {
     baseTools.push('complete_task', 'update_task_step')
@@ -235,6 +237,10 @@ export async function runInjector({ message, state, hint = '' }) {
 
   // Phase 1：ACUI 工具默认可用（组件少、token 成本低）；后续组件多了再上按需注入
   tools.push('ui_show', 'ui_update', 'ui_hide', 'ui_show_inline', 'ui_register')
+
+  // 动态追加已安装工具
+  const installedNames = getInstalledToolNames()
+  if (installedNames.length > 0) tools.push(...installedNames)
 
   return {
     memories,
@@ -320,4 +326,27 @@ export function formatTaskKnowledge(taskKnowledge = []) {
     const prefix = kind ? `[${kind}] ` : ''
     return `${prefix}${memory.content}\n  ${memory.detail}`
   }).join('\n')
+}
+
+// 根据涌现概念追加搜索记忆，排除已召回的记忆 ID
+// concepts: string[]  - 概念列表（来自 concept-extractor.js 的输出）
+// excludeIds: Set<number|string>  - 已召回记忆的 id 集合（避免重复）
+// limit: number  - 最多返回多少条，默认 10
+// returns: Memory[]  - 新增记忆对象数组（与 runInjector 返回的 memories 结构相同）
+export function searchAdditionalMemories(concepts, excludeIds, limit = 10) {
+  const seen = new Set()
+  const results = []
+
+  for (const concept of concepts) {
+    const hits = searchMemories(concept, 3)
+    for (const memory of hits) {
+      if (excludeIds.has(memory.id)) continue
+      if (seen.has(memory.id)) continue
+      seen.add(memory.id)
+      results.push(memory)
+      if (results.length >= limit) return results
+    }
+  }
+
+  return results
 }

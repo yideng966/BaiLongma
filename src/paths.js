@@ -41,7 +41,8 @@ export const paths = {
   sandboxAudioDir:    ensureDir(path.join(USER_DIR, 'sandbox', 'audio')),
   sandboxArticlesDir: ensureDir(path.join(USER_DIR, 'sandbox', 'articles')),
   sandboxLyricsDir:   ensureDir(path.join(USER_DIR, 'sandbox', 'lyrics')),
-  sandboxAppsDir:     ensureDir(path.join(USER_DIR, 'sandbox', 'apps')),
+  sandboxAppsDir:         ensureDir(path.join(USER_DIR, 'sandbox', 'apps')),
+  sandboxInstalledToolsDir: ensureDir(path.join(USER_DIR, 'sandbox', 'installed_tools')),
   musicDir:           ensureDir(path.join(USER_DIR, 'music')),
 
   indexHtml: path.join(RESOURCES_DIR, 'index.html'),

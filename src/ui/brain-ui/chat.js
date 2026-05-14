@@ -269,8 +269,30 @@ export function initChat({
     }
   });
 
+  function deleteLastUserMsg() {
+    const msgs = chatMessages.querySelectorAll('.msg-user')
+    if (!msgs.length) return
+    const last = msgs[msgs.length - 1]
+    last.style.transition = 'opacity 0.3s ease'
+    last.style.opacity = '0'
+    setTimeout(() => last.remove(), 300)
+  }
+
+  function updateLastJarvisMsg(newText) {
+    const msgs = chatMessages.querySelectorAll('.msg-jarvis');
+    if (!msgs.length) return;
+    const last = msgs[msgs.length - 1];
+    // 移除原 markdown body（label span 之后的所有子节点）
+    const children = Array.from(last.children);
+    for (let i = 1; i < children.length; i++) children[i].remove();
+    last.appendChild(createMarkdownBody(newText));
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
   return {
     addMsg,
+    deleteLastUserMsg,
+    updateLastJarvisMsg,
     applyActivationWarmupLock,
     isComposerLocked: () => inputLocked,
     isTyping,

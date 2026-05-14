@@ -2,9 +2,10 @@
 // 类似 hotspots.js 的面板状态 + TTL 上下文注入机制
 import { DOC_TOPICS as VOICE_TOPICS, detectDocTopic as detectVoiceTopic } from './docs/voice-config-faq.js'
 import { CONFIG_TOPICS } from './docs/config-faq.js'
+import { SELF_KNOWLEDGE_TOPICS, detectSelfKnowledgeTopic } from './docs/self-knowledge.js'
 
 // 合并所有文档主题
-const DOC_TOPICS = { ...VOICE_TOPICS, ...CONFIG_TOPICS }
+const DOC_TOPICS = { ...VOICE_TOPICS, ...CONFIG_TOPICS, ...SELF_KNOWLEDGE_TOPICS }
 
 function formatDocAsContext(topicId) {
   const doc = DOC_TOPICS[topicId]
@@ -27,6 +28,9 @@ function formatDocAsContext(topicId) {
 // 根据用户消息检测应打开的文档主题（意图识别，无需穷举关键词）
 function detectDocTopic(text) {
   if (!text) return null
+  const selfTopic = detectSelfKnowledgeTopic(text)
+  if (selfTopic) return selfTopic
+
   const voiceTopic = detectVoiceTopic(text)
   if (voiceTopic) return voiceTopic
 
@@ -101,7 +105,7 @@ export function buildDocPanelStateContext(detectedTopic = null) {
     `open_doc_panel tool rules. Follow strictly:`,
     `- Do not proactively ask the user for API keys. If the user provides a key, help configure it directly and mention that they can test it.`,
     `- Highest priority: when the user explicitly asks to open or view docs, immediately call open_doc_panel(action: "open", topic: "${state.topicId || 'voice_config'}"). No extra condition is required and you must not refuse.`,
-    `- When the user needs voice, model, WeChat, or social-platform configuration help, choose the matching topic and open the panel: voice_asr, voice_tts, voice_config, model_config, or wechat_config.`,
+    `- When the user needs voice, model, WeChat, or social-platform configuration help, choose the matching topic and open the panel: voice_asr, voice_tts, voice_config, model_config, or wechat_config. When the user asks about how BaiLongma works, its code architecture, or its internal mechanisms, open self_architecture.`,
     `- If the document panel is open but the current turn is unrelated to any configuration topic, immediately call open_doc_panel(topic: "${state.topicId || 'voice_config'}", action: "close") to close it.`,
   ]
 
