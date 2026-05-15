@@ -1044,14 +1044,41 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               volcanoToken:  creds.volcanoToken,
             },
           })
-          res.writeHead(200, {
-            'Content-Type': 'audio/mpeg',
-            'Transfer-Encoding': 'chunked',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*',
+          let headersWritten = false
+          let responseDone = false
+          let streamError = null
+          const finishRes = () => { if (!responseDone) { responseDone = true; res.end() } }
+          const errorRes = (msg) => { if (!responseDone) { responseDone = true; jsonResponse(res, 500, { ok: false, error: msg }) } }
+          audioStream.on('data', (chunk) => {
+            if (!headersWritten) {
+              headersWritten = true
+              res.writeHead(200, {
+                'Content-Type': 'audio/mpeg',
+                'Transfer-Encoding': 'chunked',
+                'Cache-Control': 'no-cache',
+                'Access-Control-Allow-Origin': '*',
+              })
+            }
+            res.write(chunk)
           })
-          audioStream.pipe(res)
-          audioStream.on('error', (err) => { console.warn('[TTS] 音频流错误:', err.message); try { res.end() } catch {} })
+          audioStream.on('end', () => {
+            if (!headersWritten) {
+              const errMsg = streamError?.message || '语音合成失败：API 未返回音频，请检查声音 ID 是否在账户中开通'
+              console.warn('[TTS] 空流:', errMsg)
+              errorRes(errMsg)
+            } else {
+              finishRes()
+            }
+          })
+          audioStream.on('error', (err) => {
+            console.warn('[TTS] 音频流错误:', err.message)
+            streamError = err
+            if (!headersWritten) {
+              errorRes(err.message)
+            } else {
+              finishRes()
+            }
+          })
         } catch (err) {
           console.warn('[TTS] 流式合成失败:', err.message)
           if (!res.headersSent) jsonResponse(res, 500, { ok: false, error: err.message })

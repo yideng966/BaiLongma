@@ -79,7 +79,11 @@ function resolveDoubaoResourceId(voiceId, resourceId) {
 function decodeDoubaoLine(transform, rawLine) {
   const line = rawLine.trim().replace(/^data:\s*/, '')
   if (!line || line === '[DONE]') return
-  if (!line.startsWith('{')) return
+  if (!line.startsWith('{')) {
+    // 非 JSON 行（如纯文本错误）记录到 stderr 以便调试
+    if (line.length > 0) console.warn('[豆包TTS] 非预期响应行:', line.slice(0, 200))
+    return
+  }
   const data = JSON.parse(line)
   const statusCode = Number(data.code ?? data.status_code ?? data.StatusCode ?? 0)
   if (statusCode > 0 && statusCode !== 20000000) {
@@ -90,7 +94,8 @@ function decodeDoubaoLine(transform, rawLine) {
 
 function decodeDoubaoStream(webStream) {
   let pending = ''
-  return webStreamToNode(webStream).pipe(new Transform({
+  const nodeStream = webStreamToNode(webStream)
+  const transform = new Transform({
     transform(chunk, _encoding, callback) {
       pending += chunk.toString('utf-8')
       const lines = pending.split(/\r?\n/)
@@ -110,7 +115,11 @@ function decodeDoubaoStream(webStream) {
         callback(err)
       }
     },
-  }))
+  })
+  // 把内部流的错误转发到 transform，否则外层 error 监听收不到
+  nodeStream.on('error', (err) => transform.destroy(err))
+  nodeStream.pipe(transform)
+  return transform
 }
 
 async function streamDoubao({
