@@ -46,7 +46,6 @@ export async function buildHeartbeatSystemPromptPreview({
   const systemPromptStable = buildSystemPrompt({
     agentName,
     persona,
-    existenceDesc: describeExistence(birthTime),
   })
 
   const contextBlock = buildContextBlock({
@@ -60,6 +59,8 @@ export async function buildHeartbeatSystemPromptPreview({
     task: workingState.task || null,
     taskKnowledge: taskKnowledgeText,
     extraContext: extraContextText,
+    // Runtime info 也注入预览，让 UI 看到完整 context
+    existenceDesc: describeExistence(birthTime),
   })
 
   // For the preview UI (systemPrompt.html), surface a combined view so the

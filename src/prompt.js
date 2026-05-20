@@ -70,10 +70,10 @@ export function buildSystemPrompt({
   awakeningTicks: _awakeningTicks,
   roundInfo: _roundInfo,
 } = {}) {
-  const currentTime = nowTimestamp()
-  const fixed = `You are running. Think and speak in Chinese throughout the whole turn, including any <think> blocks. Refer to yourself in the first person as "我".
-
-You have existed for ${existenceDesc}. Current system time: ${currentTime}
+  // NOTE: currentTime / existenceDesc / systemEnv 已从 system 移到 <context>。
+  // 它们每轮/每分钟变化，留在 system 会让 DeepSeek prompt cache 永远 miss。
+  // 参数仍接收以保留向后兼容签名，但不影响 system 字符串字节。
+  const fixed = `You are running. Think and speak in Chinese throughout the whole turn, including any <think> blocks. Refer to yourself in the first person as "我". The current time, how long you have existed, and any auto-gathered system facts are delivered each turn through the leading <context><runtime>...</runtime>...</context> block on the user message.
 
 ## Top-Level Behavior Rules (Highest Priority)
 - When you receive a user message, you must call the send_message tool once before making any other tool calls in this turn. Even a short acknowledgement ("ok", "received", "I'm here", "I'll take a look") must be sent. Never respond only in thought without calling the tool, and never keep calling tools without telling the user what you are doing. In general, whenever something important happens, call send_message and say it.
@@ -136,7 +136,6 @@ When the user's message is unclear, incomplete, or has multiple plausible interp
 Platform: Windows. Shell for exec_command: PowerShell.
 exec_command sandbox: ${security?.execSandbox !== false ? 'ENABLED — commands run inside sandbox/, absolute paths and home-directory references are blocked.' : 'DISABLED — commands can access the full filesystem including Desktop, user profile, and absolute paths.'}
 
-${systemEnv}
 ## Tool Usage Reminders
 - When the user asks you to run a command or perform a file/system operation, always call exec_command directly. Do not preemptively refuse based on assumed restrictions — the tool will return an error if the operation is not permitted. Try first, explain only if the tool actually fails.
 - Reuse existing context whenever possible. Do not reread files, relist directories, or repeat tool calls without a reason.
@@ -285,8 +284,25 @@ export function buildContextBlock({
   focusFrame = null,
   focusStack = null,
   focusTickCounter = 0,
+  // Runtime info（每轮都变化、所以从 system 迁过来）：
+  //   currentTime    — 当前 ISO 时间戳
+  //   existenceDesc  — "X 小时 Y 分钟" 之类的存活描述
+  //   systemEnv      — 根据消息触发的环境块（天气/系统/桌面/热点）
+  currentTime = '',
+  existenceDesc = '',
+  systemEnv = '',
 } = {}) {
   const sections = []
+
+  // <runtime> —— 把每轮变动的"现在时刻 / 存活时长 / 触发型环境块"集中放最前面，
+  // 让稳定的 system 字段真的命中 prompt cache（DeepSeek prefix cache 要前缀字节一致）。
+  const runtimeParts = []
+  if (currentTime)   runtimeParts.push(`Current time: ${currentTime}`)
+  if (existenceDesc) runtimeParts.push(`You have existed for ${existenceDesc}.`)
+  if (systemEnv)     runtimeParts.push(systemEnv)
+  if (runtimeParts.length > 0) {
+    sections.push(`<runtime>\n${runtimeParts.join('\n\n')}\n</runtime>`)
+  }
 
   // Behavior constraints — soft, per-round (must be obeyed this turn)
   if (constraints?.length > 0) {

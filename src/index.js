@@ -934,12 +934,12 @@ async function process(input, label, msg = null) {
     const hasActiveTask = !!state.task
     const extraContextJoined = [presenceText, hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n')
 
+    // system 只留稳定硬底线（agent_name / persona / security）—— 让 DeepSeek prefix cache
+    // 真正命中。currentTime / existenceDesc / systemEnv 改走 <runtime> 段（每轮变化）。
     const systemPrompt = buildSystemPrompt({
       agentName,
       persona,
-      existenceDesc: describeExistence(birthTime),
       security: getSecurity(),
-      systemEnv: buildSystemEnv(msg),
     })
 
     const baseContextArgs = {
@@ -955,6 +955,10 @@ async function process(input, label, msg = null) {
       extraContext: extraContextJoined,
       awakeningTicks: getAwakeningTicks(),
       focusStack: state.focusStack || [],
+      // Runtime info：从 system 迁来的每轮变化字段，集中放 <context><runtime>
+      currentTime: nowTimestamp(),
+      existenceDesc: describeExistence(birthTime),
+      systemEnv: buildSystemEnv(msg),
       focusTickCounter: state.tickCounter || 0,
     }
     let contextBlock = buildContextBlock(baseContextArgs)
