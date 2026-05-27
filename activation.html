@@ -27,37 +27,85 @@
       box-sizing: border-box;
     }
     main {
-      width: 520px;
+      width: 480px;
       max-width: 100%;
-      padding: 32px;
-      border-radius: 22px;
+      padding: 28px 28px 24px;
+      border-radius: 18px;
       border: 1px solid rgba(150, 185, 255, 0.18);
       background: rgba(10, 17, 27, 0.8);
       box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
       backdrop-filter: blur(20px);
     }
     h1 {
-      margin: 0 0 8px;
-      font-size: 28px;
-      line-height: 1.2;
-      font-weight: 700;
+      margin: 0 0 6px;
+      font-size: 22px;
+      line-height: 1.25;
+      font-weight: 600;
       color: #f5f8fd;
+      letter-spacing: -0.01em;
     }
     .subtitle {
-      margin: 0 0 28px;
-      font-size: 15px;
-      color: #9db0c8;
+      margin: 0 0 22px;
+      font-size: 13px;
+      color: #8396ae;
     }
     .row {
-      margin-bottom: 14px;
+      display: flex;
+      align-items: stretch;
+      margin-bottom: 10px;
+      border: 1px solid rgba(132, 161, 204, 0.22);
+      border-radius: 12px;
+      background: rgba(16, 25, 38, 0.94);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
-    label {
-      display: block;
-      margin-bottom: 7px;
+    .row:focus-within {
+      border-color: rgba(117, 168, 255, 0.72);
+      box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.14);
+    }
+    .row > label {
+      flex: 0 0 78px;
+      margin: 0;
+      padding: 0 8px 0 14px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
       font-size: 12px;
-      color: #b1c1d7;
+      color: #7a90a8;
+      text-align: left;
+      letter-spacing: 0;
+      line-height: 1.3;
+      background: rgba(10, 17, 27, 0.4);
+      border-right: 1px solid rgba(132, 161, 204, 0.1);
+      border-radius: 11px 0 0 11px;
+    }
+    .row > .input-wrap,
+    .row > input,
+    .row > select {
+      flex: 1;
+      min-width: 0;
+    }
+    .row-hint {
+      margin: 4px 0 14px 15px;
+      font-size: 12px;
+      color: #7a90a8;
+      line-height: 1.5;
+    }
+    .section-divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 18px 0 14px;
+      font-size: 11px;
+      color: #6a82a0;
       letter-spacing: 0.05em;
-      text-transform: uppercase;
+      font-weight: 500;
+    }
+    .section-divider::before,
+    .section-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: rgba(132, 161, 204, 0.1);
     }
     .input-wrap {
       position: relative;
@@ -65,18 +113,15 @@
     input {
       width: 100%;
       box-sizing: border-box;
-      border: 1px solid rgba(132, 161, 204, 0.24);
-      border-radius: 12px;
-      background: rgba(16, 25, 38, 0.94);
+      border: none;
+      background: transparent;
       color: #edf4ff;
-      padding: 13px 14px;
-      font-size: 15px;
+      padding: 11px 14px;
+      font-size: 14px;
       outline: none;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
     input:focus {
-      border-color: rgba(117, 168, 255, 0.72);
-      box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.14);
+      outline: none;
     }
     input.has-detect {
       padding-right: 100px;
@@ -108,9 +153,10 @@
       border-radius: 12px;
       background: linear-gradient(135deg, #4f8cff 0%, #3572ff 100%);
       color: #ffffff;
-      padding: 14px 16px;
-      font-size: 16px;
-      font-weight: 700;
+      padding: 12px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
       cursor: pointer;
       transition: transform 0.15s ease, opacity 0.15s ease, filter 0.15s ease;
     }
@@ -132,15 +178,6 @@
     }
     .status.err { color: #ff8f8f; }
     .status.ok  { color: #74d89f; }
-    .model-note {
-      margin: 0 0 24px;
-      padding: 10px 14px;
-      border-radius: 10px;
-      background: rgba(16, 25, 38, 0.78);
-      border: 1px solid rgba(132, 161, 204, 0.14);
-      font-size: 13px;
-      color: #d8e4f5;
-    }
     .hint {
       margin-top: 18px;
       color: #8396ae;
@@ -157,73 +194,60 @@
 
     /* ── Optional sections (STT / TTS) ── */
     .opt-section {
-      margin-top: 10px;
+      margin-top: 14px;
     }
-    .opt-toggle {
+    .opt-section-label {
+      margin: 0 0 6px;
+      font-size: 12px;
+      color: #8396ae;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+    .opt-section-label .opt-label-hint {
+      color: #6a7689;
+      font-weight: 400;
+    }
+    .emb-toggle {
       display: flex;
       align-items: center;
-      gap: 7px;
+      justify-content: space-between;
       width: 100%;
       background: none;
       border: none;
-      padding: 9px 12px;
-      border-radius: 10px;
-      font-size: 13px;
-      color: #6a82a0;
+      padding: 0 2px;
+      margin: 0;
       cursor: pointer;
       text-align: left;
-      transition: background 0.15s, color 0.15s;
     }
-    .opt-toggle:hover {
-      background: rgba(100, 150, 220, 0.07);
-      color: #9db0c8;
+    .emb-toggle .opt-section-label {
+      margin: 0;
     }
-    .opt-toggle.open {
-      color: #74a8ff;
-      background: rgba(100, 150, 255, 0.07);
+    .emb-toggle-icon {
+      font-size: 14px;
+      font-weight: 500;
+      color: #6a7689;
+      transition: transform 0.2s, color 0.15s;
     }
-    .opt-toggle-icon {
-      font-size: 15px;
-      font-weight: 700;
-      width: 16px;
-      text-align: center;
-      transition: transform 0.2s;
-      flex-shrink: 0;
+    .emb-toggle:hover .emb-toggle-icon {
+      color: #9da9bd;
     }
-    .opt-toggle.open .opt-toggle-icon {
+    .emb-toggle.open .emb-toggle-icon {
       transform: rotate(45deg);
-    }
-    .opt-toggle-label {
-      flex: 1;
-    }
-    .opt-chip {
-      font-size: 11px;
-      font-weight: 600;
-      padding: 2px 8px;
-      border-radius: 20px;
-      color: #74d89f;
-      background: rgba(100, 220, 155, 0.1);
-      border: 1px solid rgba(100, 220, 155, 0.22);
-      opacity: 0;
-      transition: opacity 0.2s;
-    }
-    .opt-chip.visible {
-      opacity: 1;
+      color: #b1c1d7;
     }
     .opt-body {
-      padding: 8px 2px 6px 4px;
       overflow: hidden;
     }
     .opt-body .row:last-child {
       margin-bottom: 0;
     }
     .opt-row-group {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 14px;
+      margin-bottom: 10px;
     }
     .opt-row-group .row {
+      margin-bottom: 8px;
+    }
+    .opt-row-group .row:last-child {
       margin-bottom: 0;
     }
 
@@ -231,18 +255,17 @@
     select.emb-select {
       width: 100%;
       box-sizing: border-box;
-      border: 1px solid rgba(132, 161, 204, 0.24);
-      border-radius: 12px;
-      background: rgba(16, 25, 38, 0.94);
+      border: none;
+      background: transparent;
       color: #edf4ff;
-      padding: 12px 14px;
-      font-size: 15px;
+      padding: 11px 14px;
+      font-size: 14px;
       outline: none;
       appearance: none;
+      cursor: pointer;
     }
     select.emb-select:focus {
-      border-color: rgba(117, 168, 255, 0.72);
-      box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.14);
+      outline: none;
     }
     .emb-status-line {
       font-size: 12px;
@@ -331,68 +354,52 @@
     <h1>激活 Bailongma</h1>
     <p class="subtitle">输入 API Key，Bailongma 会自动识别官方模型厂商。</p>
 
-    <div class="model-note">
-      支持自动检测 DeepSeek、MiniMax、OpenAI、通义千问、Moonshot、智谱等官方直连端点。
+    <!-- LLM Key -->
+    <div class="row">
+      <label for="apiKey">LLM Key</label>
+      <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 API Key" />
     </div>
+    <div class="row-hint">支持 DeepSeek、MiniMax、OpenAI、通义千问、Moonshot、智谱等官方端点</div>
 
     <!-- AI 名字 -->
     <div class="row">
-      <label for="agentName">给 AI 起个名字 <span style="color:#7a90a8;text-transform:none;letter-spacing:0;font-weight:400;">（可选，留空则用默认"小白龙"）</span></label>
-      <input id="agentName" type="text" autocomplete="off" spellcheck="false" maxlength="32" placeholder="例如：小白、贾维斯、Tony……" />
+      <label for="agentName">AI 名字</label>
+      <input id="agentName" type="text" autocomplete="off" spellcheck="false" maxlength="32" placeholder="小白龙（默认）、贾维斯、Friday、小白" />
     </div>
 
-    <!-- LLM Key -->
-    <div class="row">
-      <label for="apiKey">LLM API Key</label>
-      <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="请输入 LLM API Key" />
-    </div>
+    <div class="section-divider">可选 可不填</div>
 
     <!-- STT Optional Section -->
     <div class="opt-section">
-      <button class="opt-toggle" id="stt-toggle" type="button">
-        <span class="opt-toggle-icon">+</span>
-        <span class="opt-toggle-label">语音识别 Key <span style="color:#7a90a8;font-weight:400;">（可选）</span></span>
-        <span class="opt-chip" id="stt-chip">已配置</span>
-      </button>
-      <div class="opt-body" id="stt-body" style="display:none">
-        <div class="row">
-          <label for="stt-key">粘贴 Key 自动识别厂商</label>
-          <div class="input-wrap">
-            <input id="stt-key" class="has-detect" type="password" autocomplete="off" spellcheck="false"
-              placeholder="API Key / SecretId / AppId" />
-            <span class="detect-badge" id="stt-detect-badge"></span>
-          </div>
+      <div class="row">
+        <label for="stt-key">语音识别 Key</label>
+        <div class="input-wrap">
+          <input id="stt-key" class="has-detect" type="password" autocomplete="off" spellcheck="false"
+            placeholder="粘贴 Key 自动识别厂商" />
+          <span class="detect-badge" id="stt-detect-badge"></span>
         </div>
-        <div id="stt-extra"></div>
       </div>
+      <div id="stt-extra"></div>
     </div>
 
     <!-- TTS Optional Section -->
     <div class="opt-section">
-      <button class="opt-toggle" id="tts-toggle" type="button">
-        <span class="opt-toggle-icon">+</span>
-        <span class="opt-toggle-label">语音合成 Key <span style="color:#7a90a8;font-weight:400;">（可选）</span></span>
-        <span class="opt-chip" id="tts-chip">已配置</span>
-      </button>
-      <div class="opt-body" id="tts-body" style="display:none">
-        <div class="row">
-          <label for="tts-key">粘贴 Key 自动识别厂商</label>
-          <div class="input-wrap">
-            <input id="tts-key" class="has-detect" type="password" autocomplete="off" spellcheck="false"
-              placeholder="API Key" />
-            <span class="detect-badge" id="tts-detect-badge"></span>
-          </div>
+      <div class="row">
+        <label for="tts-key">语音合成 Key</label>
+        <div class="input-wrap">
+          <input id="tts-key" class="has-detect" type="password" autocomplete="off" spellcheck="false"
+            placeholder="粘贴 Key 自动识别厂商" />
+          <span class="detect-badge" id="tts-detect-badge"></span>
         </div>
-        <div id="tts-extra"></div>
       </div>
+      <div id="tts-extra"></div>
     </div>
 
     <!-- Embedding Optional Section -->
     <div class="opt-section">
-      <button class="opt-toggle" id="emb-toggle" type="button">
-        <span class="opt-toggle-icon">+</span>
-        <span class="opt-toggle-label">记忆向量召回（Embedding） <span style="color:#7a90a8;font-weight:400;">（可选）</span></span>
-        <span class="opt-chip" id="emb-chip">已配置</span>
+      <button class="emb-toggle" id="emb-toggle" type="button">
+        <span class="opt-section-label">记忆向量召回（Embedding） <span class="opt-label-hint">（可选）</span></span>
+        <span class="emb-toggle-icon">+</span>
       </button>
       <div class="opt-body" id="emb-body" style="display:none">
         <div class="emb-status-line" id="emb-status-line">当前状态：<span class="no" id="emb-configured-text">未配置</span></div>
@@ -419,8 +426,8 @@
           <input id="emb-baseurl" type="text" autocomplete="off" spellcheck="false" placeholder="留空使用 provider 默认端点" />
         </div>
         <div class="row">
-          <label for="emb-dimensions">Dimensions（维度，可选）</label>
-          <input id="emb-dimensions" type="number" min="1" autocomplete="off" spellcheck="false" placeholder="留空使用模型默认" />
+          <label for="emb-dimensions">Dimensions</label>
+          <input id="emb-dimensions" type="number" min="1" autocomplete="off" spellcheck="false" placeholder="维度，留空使用模型默认" />
         </div>
         <div class="emb-actions">
           <button type="button" class="emb-btn primary" id="emb-save">保存</button>
@@ -451,11 +458,11 @@
           <input id="customBaseUrl" type="text" placeholder="如 http://localhost:11434/v1" autocomplete="off" spellcheck="false" />
         </div>
         <div class="row">
-          <label for="customModel">模型名称</label>
+          <label for="customModel">模型</label>
           <input id="customModel" type="text" placeholder="如 llama3.2, qwen2.5, mistral" autocomplete="off" spellcheck="false" />
         </div>
         <div class="row">
-          <label for="customApiKey">API Key（可选）</label>
+          <label for="customApiKey">API Key</label>
           <input id="customApiKey" type="password" placeholder="本地模型可留空" autocomplete="off" spellcheck="false" />
         </div>
         <button class="primary" id="activate-custom" disabled>测试连接并进入</button>
@@ -567,21 +574,11 @@
     }
 
     // ── Generic optional section logic ──
-    function setupOptSection({ toggleId, bodyId, keyInputId, detectBadgeId, extraContainerId, chipId, detectFn, configKey }) {
-      const toggle = document.getElementById(toggleId)
-      const body = document.getElementById(bodyId)
+    function setupOptSection({ keyInputId, detectBadgeId, extraContainerId, detectFn }) {
       const keyInput = document.getElementById(keyInputId)
       const badge = document.getElementById(detectBadgeId)
       const extra = document.getElementById(extraContainerId)
-      const chip = document.getElementById(chipId)
       let detected = null
-
-      toggle.addEventListener('click', () => {
-        const isOpen = toggle.classList.contains('open')
-        toggle.classList.toggle('open', !isOpen)
-        body.style.display = isOpen ? 'none' : ''
-        if (!isOpen) keyInput.focus()
-      })
 
       keyInput.addEventListener('input', () => {
         const key = keyInput.value.trim()
@@ -594,7 +591,6 @@
           badge.classList.remove('visible')
         }
         renderExtra(detected)
-        updateChip()
       })
 
       function renderExtra(info) {
@@ -611,11 +607,6 @@
           group.appendChild(div)
         }
         extra.appendChild(group)
-      }
-
-      function updateChip() {
-        const hasKey = keyInput.value.trim().length > 0
-        chip.classList.toggle('visible', hasKey)
       }
 
       function getConfig() {
@@ -637,23 +628,20 @@
     }
 
     const sttSection = setupOptSection({
-      toggleId: 'stt-toggle', bodyId: 'stt-body',
       keyInputId: 'stt-key', detectBadgeId: 'stt-detect-badge',
-      extraContainerId: 'stt-extra', chipId: 'stt-chip',
+      extraContainerId: 'stt-extra',
       detectFn: detectSTTProvider,
     })
 
     const ttsSection = setupOptSection({
-      toggleId: 'tts-toggle', bodyId: 'tts-body',
       keyInputId: 'tts-key', detectBadgeId: 'tts-detect-badge',
-      extraContainerId: 'tts-extra', chipId: 'tts-chip',
+      extraContainerId: 'tts-extra',
       detectFn: detectTTSProvider,
     })
 
     // ── Embedding settings card ──
     const embToggle       = document.getElementById('emb-toggle')
     const embBody         = document.getElementById('emb-body')
-    const embChip         = document.getElementById('emb-chip')
     const embProviderSel  = document.getElementById('emb-provider')
     const embModelInput   = document.getElementById('emb-model')
     const embApiKeyInput  = document.getElementById('emb-apikey')
@@ -681,7 +669,6 @@
     function updateEmbConfiguredLabel(configured) {
       embConfiguredEl.textContent = configured ? '已配置' : '未配置'
       embConfiguredEl.className = configured ? 'yes' : 'no'
-      embChip.classList.toggle('visible', !!configured)
     }
 
     function applyPresetDefaults(provider, { force = false } = {}) {
