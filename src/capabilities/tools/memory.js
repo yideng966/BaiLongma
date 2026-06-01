@@ -7,6 +7,7 @@ import {
   hideMemoryByMemId,
 } from '../../db.js'
 import { emitEvent } from '../../events.js'
+import { extractKeywords } from '../../memory/keywords.js'
 
 // search_memory：批量按关键词检索记忆。
 // 优先走 keywords 数组；为兼容旧调用方，单字符串 keyword 也接受（自动转数组）。
@@ -219,6 +220,57 @@ export async function execDowngradeMemory(args = {}) {
 // skip_consolidation：整合器显式表示本批无需操作
 export async function execSkipConsolidation({ reason } = {}) {
   return JSON.stringify({ ok: true, skipped: true, reason: reason || '' })
+}
+
+// probe_memory：诊断工具——"如果现在问 X，记忆库会拉到什么？"
+// 与 search_memory / recall_memory 的区别：
+//   - 无副作用：不设 state.prev_recall，不影响下一轮注入
+//   - 输出更详细：双路命中（直接 FTS + 多关键词 FTS）+ 元信息（event_type / salience / mem_id）
+//   - 用途：自检"召回是否健康"；用户问"你能想起 X 吗"时主动确认
+// 当探测结果为空，提示"如果用户认为你应该记得，可能是召回漏或抽取漏"。
+export async function execProbeMemory(args = {}) {
+  const query = String(args.query || '').trim()
+  if (!query) return JSON.stringify({ ok: false, error: 'missing query' })
+
+  const directHits = searchMemories(query, 8)
+
+  let keywordHits = []
+  try {
+    const kws = extractKeywords(query).slice(0, 6)
+    if (kws.length > 0) {
+      keywordHits = searchMemoriesByKeywords(kws, { limitPerKeyword: 3 })
+    }
+  } catch {}
+
+  const seen = new Set()
+  const merged = []
+  for (const m of [...directHits, ...keywordHits]) {
+    const key = m.mem_id || m.id
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push({
+      id: m.id,
+      mem_id: m.mem_id || null,
+      event_type: m.event_type || m.type || null,
+      title: m.title || '',
+      content: (m.content || '').slice(0, 200),
+      salience: m.salience || null,
+      timestamp: m.timestamp || m.created_at || null,
+      matched_by: m.matched_by || null,
+    })
+  }
+
+  return JSON.stringify({
+    ok: true,
+    query,
+    total: merged.length,
+    direct_count: directHits.length,
+    keyword_count: keywordHits.length,
+    hits: merged.slice(0, 10),
+    hint: merged.length === 0
+      ? '召回为空。可能原因：① 该信息从未被抽取（抽取漏）② 抽取了但 embedding/FTS 没命中此 query（召回漏）。可对照 conversations 表 + recall_audit 表交叉验证。'
+      : null,
+  }, null, 2)
 }
 
 export async function execRecallMemory({ query }, context) {

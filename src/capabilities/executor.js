@@ -1,6 +1,6 @@
 import crypto from 'crypto'
 import { nowTimestamp } from '../time.js'
-import { normalizeConversationPartyId, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertConversation, setConfig as dbSetConfig, markConversationOpenQuestion } from '../db.js'
+import { normalizeConversationPartyId, upsertPrefetchTask, removePrefetchTask, listPrefetchTasks, insertConversation, setConfig as dbSetConfig, markConversationOpenQuestion, findRecentJarvisDuplicate } from '../db.js'
 import { emitEvent, emitUICommand, hasACUIClient, addActiveUICard, setStickyEvent } from '../events.js'
 import { dispatchSocialMessage } from '../social/dispatch.js'
 import { setCustomInterval as setTickerInterval, getStatus as getTickerStatus } from '../ticker.js'
@@ -18,7 +18,7 @@ import { inferToolStatus, writeToolAuditLog } from './tool-audit.js'
 import { execDeleteFile, execListDir, execMakeDir, execReadFile, execWriteFile } from './tools/filesystem.js'
 import { execCommand, execKillProcess, execListProcesses } from './tools/shell.js'
 import { execBrowserRead, execFetchUrl, execWebSearch } from './tools/web.js'
-import { execDowngradeMemory, execMergeMemories, execRecallMemory, execSearchMemory, execSkipConsolidation, execSkipRecognition, execUpsertMemory } from './tools/memory.js'
+import { execDowngradeMemory, execMergeMemories, execProbeMemory, execRecallMemory, execSearchMemory, execSkipConsolidation, execSkipRecognition, execUpsertMemory } from './tools/memory.js'
 import { execManageReminder } from './tools/reminders.js'
 import { execGenerateImage, execGenerateLyrics, execGenerateMusic, execMediaMode, execMusic, execSpeak } from './tools/media.js'
 import { execManageRule } from './tools/rules.js'
@@ -82,6 +82,8 @@ async function executeToolUnchecked(name, args, context = {}) {
         return await execBrowserRead(args, context)
       case 'search_memory':
         return await execSearchMemory(args)
+      case 'probe_memory':
+        return await execProbeMemory(args)
       case 'upsert_memory':
         return await execUpsertMemory(args, context)
       case 'skip_recognition':
@@ -288,6 +290,16 @@ async function execSendMessage({ target_id, content, channel = 'AUTO' }, context
   const delivery = resolveDeliveryTarget(resolvedId, channel, context)
   if (delivery.error) return `错误：${delivery.error}`
 
+  // 防重发：最近 5 分钟内对同一 target 发过一字不差的同样内容 → 拒绝。
+  //   常见诱因：启动期 directions（delegation ask 等）在用户回应前每 tick 都注入相同指令，
+  //   模型每次都被驱动着发一遍同一句话。让 send_message 直接拦下来，并告知模型该停。
+  const dup = findRecentJarvisDuplicate(resolvedId, cleanedContent, 5 * 60 * 1000)
+  if (dup) {
+    const ageSec = Math.max(0, Math.round(dup.ageMs / 1000))
+    const preview = cleanedContent.length > 50 ? cleanedContent.slice(0, 50) + '…' : cleanedContent
+    return `错误：这条消息（"${preview}"）你在 ${ageSec} 秒前已发给 ${resolvedId} 一次（conversation id=${dup.id}），对方还没回应。重发同一句话是无效且让人反感的行为。本轮不要再调用 send_message；保持安静，等对方主动回应再继续，或者下一轮换一种表达方式与新内容。`
+  }
+
   const timestamp = nowTimestamp()
   const channelLabel = delivery.deliveryChannel || (delivery.isLocal ? 'TUI' : '')
   console.log(`\n[消息发送] → ${resolvedId}${delivery.externalTargetId ? ` via ${delivery.externalTargetId}` : ''}${channelLabel ? ` [${channelLabel}]` : ''}`)
@@ -406,6 +418,20 @@ function execManagePrefetchTask({ action, source, label, url, ttl_minutes, tags 
 function execSetTickInterval({ seconds, ttl, reason }) {
   const res = setTickerInterval({ seconds, ttl, reason })
   if (!res.ok) return `错误：${res.error}`
+  // noop 路径：返回 JSON 让 isToolFailure 识别为软失败,触发 maxSameFailures 熔断。
+  // 旧的纯文本返回 isToolFailure 检测不到失败,模型在同 callLLM 内可以无限重调浪费 round。
+  // ok:false 让前端也明确显示"无效调用",别再误导用户以为节奏变了。
+  if (res.noop) {
+    return JSON.stringify({
+      ok: false,
+      tool: 'set_tick_interval',
+      noop: true,
+      seconds: res.seconds,
+      ttl: res.ttl,
+      error: `tick interval already ${res.seconds}s with ${res.ttl} rounds left; call rejected as no-op`,
+      reason: 'Calling set_tick_interval with the current value is a no-op and wastes a round. Only call when you actually need to change the pace.',
+    })
+  }
   const parts = [`节奏已设为 ${res.seconds}s，持续 ${res.ttl} 轮`]
   if (res.clampedFrom?.seconds !== undefined) parts.push(`（seconds ${res.clampedFrom.seconds} 越界，已 clamp 到 ${res.seconds}）`)
   if (res.clampedFrom?.ttl !== undefined) parts.push(`（ttl ${res.clampedFrom.ttl} 越界，已 clamp 到 ${res.ttl}）`)
@@ -621,7 +647,15 @@ function execSetSecurity({ file_sandbox, exec_sandbox, reason = '' }) {
   emitUICommand({ op: 'mount', id, component: 'SecurityConfirmCard', props, hint: { placement: 'center' } })
   addActiveUICard(id, { component: 'SecurityConfirmCard' })
   emitEvent('action', { tool: 'set_security', summary: '等待用户确认安全设置变更', detail: id })
-  return toolJson({ ok: true, id, status: 'pending_confirmation', message: '已弹出确认卡片，等待用户确认。' })
+  // 工具返回 message 明确告诉模型"卡片已经在 UI 上、用户能直接看到"——避免模型把
+  // "已弹出确认卡片"这句话当成"用户还不知道，我要 send_message 复述一遍"的口播触发。
+  // 用户点确认/取消时会收到 silent APP_SIGNAL turn，那时再做内部 state 更新（也不需要 send_message）。
+  return toolJson({
+    ok: true,
+    id,
+    status: 'pending_confirmation',
+    message: '确认卡片已挂出（component=SecurityConfirmCard，居中弹窗，含"确认/取消"按钮）。用户在屏幕上直接看到了完整内容，不需要你再 send_message 复述卡片说什么或提醒用户去点确认 —— 那是冗余的口播。等用户点完，系统会用 silent APP_SIGNAL 通知你结果，那一轮也无需 send_message。本轮直接结束即可。',
+  })
 }
 
 // 把 Agent 的文档信息格式化成错误响应里的引导字段

@@ -51,6 +51,12 @@ export const TOOL_SCHEMAS = {
         '## One action, one message',
         '• Do not send "我去做" before a tool call and then "做完了" after. Call the tool, then send ONE message with the result. If you sent a heads-up before the tool, do not repeat the same content after the tool returns.',
         '• When a single user turn deserves a reply, send exactly one send_message in that turn. Multiple sends in one turn are only acceptable when the contents are genuinely different (e.g. a status update during a long task that takes many seconds).',
+        '• NEVER split a closing pleasantry into a second send_message. If you already sent the main reply and feel tempted to follow up with "有需要随时叫我", "希望对你有帮助", "还有什么需要吗", "为您效劳", "祝你..." — STOP. Those lines add zero information; merge them into nothing, not into a second call. The runtime will suppress such follow-up sends as filler.',
+        '',
+        '## A message is written TO the user, never a note to yourself',
+        '• send_message content is delivered verbatim to the user. It must be addressed TO them, in second person — not internal monologue ABOUT them or ABOUT what you are doing.',
+        '• Your reasoning, plans, and decisions — including the decision NOT to reply — stay in your thinking. They are never message content. Examples of self-talk that must NEVER be sent: "已经和用户打过招呼了，不需要再发第二条", "安静等待", "我先观察一下", "这条不用回了", "I should stay quiet now".',
+        '• If you conclude that no reply is needed, simply do not call send_message — end the turn silently. Do NOT announce that you are staying silent; announcing it IS sending a message, which defeats the decision.',
         '',
         '## Respect the user\'s attention',
         '• A "你好"/"在吗" greeting deserves a brief greeting back. Do not steer it toward a topic the user did not raise. If you have a pending thought from your own tick loop, hold it until the user shows interest.',
@@ -640,6 +646,24 @@ To play music, use media_mode with mode=music and src=file_path to show the reco
           }
         },
         required: ['keywords']
+      }
+    }
+  },
+
+  probe_memory: {
+    type: 'function',
+    function: {
+      name: 'probe_memory',
+      description: 'Diagnostic probe: ask "if I queried for X right now, what would the memory layer return?" — no side effects, does NOT influence the next turn injection. Use when the user asks "do you remember X?" and you want to verify what memory would surface, or for self-diagnosing recall coverage. Returns matched memory IDs with event_type, salience, and a hint when recall is empty (suggesting extraction vs recall miss).',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Natural-language probe query. Will be tokenized and run against direct FTS + multi-keyword FTS in parallel.'
+          }
+        },
+        required: ['query']
       }
     }
   },

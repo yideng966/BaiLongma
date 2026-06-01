@@ -179,21 +179,35 @@ function parseWeatherData(data, location) {
 
 /* ── 公开 API ── */
 
+// Wave 1：in-flight promise dedup —— runRuntimeInjector 并发后 buildWeatherRuntimeContext
+//   和 getWeatherCardProps 会同时调本函数，cache 未 fresh 时两个都会发 HTTP。
+//   用 inflight map 让同 location 的并发请求共享一个 promise。
+const inflight = new Map()
+
 export async function fetchAndCacheWeather(location) {
   if (!location) return null
   if (isCacheFresh(location)) return cache
 
-  try {
-    console.log(`[天气] 拉取 ${location} 天气...`)
-    const data = await fetchWeatherData(location)
-    const parsed = parseWeatherData(data, location)
-    if (!parsed) return null
-    cache = { location, ...parsed, fetchedAt: Date.now() }
-    return cache
-  } catch (err) {
-    console.warn(`[天气] 拉取失败：${err.message}`)
-    return (cache?.location === location) ? cache : null
-  }
+  // 同 location 的请求已经在跑 → 直接复用
+  if (inflight.has(location)) return inflight.get(location)
+
+  const promise = (async () => {
+    try {
+      console.log(`[天气] 拉取 ${location} 天气...`)
+      const data = await fetchWeatherData(location)
+      const parsed = parseWeatherData(data, location)
+      if (!parsed) return null
+      cache = { location, ...parsed, fetchedAt: Date.now() }
+      return cache
+    } catch (err) {
+      console.warn(`[天气] 拉取失败：${err.message}`)
+      return (cache?.location === location) ? cache : null
+    } finally {
+      inflight.delete(location)
+    }
+  })()
+  inflight.set(location, promise)
+  return promise
 }
 
 export function isWeatherQuery(message = '') {

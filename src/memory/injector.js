@@ -12,6 +12,7 @@ import {
   getUnconsumedUISignals,
   markUISignalsConsumed,
   getConfig,
+  insertRecallAudit,
 } from '../db.js'
 import { getActiveUICards } from '../events.js'
 import { getInstalledToolNames } from '../capabilities/marketplace/index.js'
@@ -82,6 +83,35 @@ function rerankByImportance(memories) {
     if (sa !== sb) return sa - sb           // 同 boost 内陈旧（>365天）下沉
     return 0                                // 其余维持原顺序（stable sort）
   })
+}
+
+// 动态上下文记忆池 ·「少即是强」选择器（取代旧的 rerankByImportance(merged).slice(cap)）
+//
+// 旧逻辑的病灶：searchRelevantMemories 已按相关度排好序（focus FTS → 向量 → context FTS），
+// senderMemories 接在其后；但随后 rerankByImportance 按 salience 把整列重排，会把"重要但跟
+// 当前问题无关"的记忆（尤其 senderMemories 这种纯 entity 召回、对当前 query 零相关度的条目）
+// 顶到 context 前排 → 掺杂不相关信息 → 上下文焦虑 → 输出质量下降。
+//
+// 新逻辑：
+//   - 保留 candidates 既有的相关度序（不再按 salience 整体重排）。
+//   - 只给高 salience 锚（≥4，如硬约束/身份）留一条窄保留道：cap 之外的锚最多救回 anchorLane 条，
+//     替换掉 cap 内末尾（相关度最弱）的位置，确保常驻锚不被挤掉，但不喧宾夺主。
+//   - ftsFloor：相关度地板（基于 db.searchMemories 带出的 bm25 _ftsScore，越小越相关；
+//     丢弃 _ftsScore > ftsFloor 的弱命中，即使 cap 还有空位）。Phase 1 默认 null=关闭——
+//     先用现有 recall_audit 回看相关度分布，再于 Phase 2 标定阈值开启。无分的候选（向量/LIKE
+//     兜底/entity 召回）一律豁免地板。
+export function selectContextMemories(candidates, { cap, anchorLane = 2, ftsFloor = null } = {}) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return []
+  const floored = ftsFloor == null
+    ? candidates
+    : candidates.filter(m => !Number.isFinite(m?._ftsScore) || m._ftsScore <= ftsFloor)
+  if (floored.length <= cap) return floored
+  const inCap = floored.slice(0, cap)
+  const overflow = floored.slice(cap)
+  const anchors = overflow.filter(m => (Number(m?.salience) || 0) >= 4).slice(0, Math.max(0, anchorLane))
+  if (anchors.length === 0) return inCap
+  const keep = inCap.slice(0, Math.max(0, cap - anchors.length))
+  return [...keep, ...anchors]
 }
 
 // 相关记忆搜索：双输入函数（focus + context） + 向量召回兜底
@@ -242,6 +272,7 @@ export function formatTemporalRecall(buckets) {
 
 // hint：一层思考器的输出文本，用于扩展 L2 的记忆检索范围
 export async function runInjector({ message, state, hint = '' }) {
+  const injectorStartedAt = Date.now()
   const lastToolResult = state?.lastToolResult || null
   if (lastToolResult) state.lastToolResult = null
 
@@ -348,9 +379,15 @@ export async function runInjector({ message, state, hint = '' }) {
     }
   }
 
+  // 召回上限：有对话历史时放宽到 30，否则 12。
+  // 不再按"消息是否 trivial"的正则判定收紧——浅层模式不该替模型决定要不要省召回，
+  // 复合意图（如"还有多少电？顺便分析下昨天的 bug"）下这种收紧会误杀需要 reasoning 的部分。
+  // 该注入的 context 照常注入，由模型自己决定怎么用。
   const mergeCap = hasHistory ? 30 : 12
   const merged = deduplicateMemories([relevantMemories, senderMemories])
-  const memories = rerankByImportance(merged).slice(0, mergeCap)
+  // 「少即是强」：保留 merged 的相关度序，只给高 salience 锚留窄保留道；
+  // 不再用 rerankByImportance 按 salience 整体重排（详见 selectContextMemories 注释）。
+  const memories = selectContextMemories(merged, { cap: mergeCap, anchorLane: 2 })
 
   // —— 按需注入工具（动态上下文记忆池第 4 步）——
   // 之前把 ~35 个工具全量注入，每轮 6-9K token 大头在这。改成按意图分组：
@@ -396,6 +433,33 @@ export async function runInjector({ message, state, hint = '' }) {
   // 注入器拿 agent_name 用作身份锚的开头（"你是 小白龙。..."）。
   const agentName = getConfig('agent_name') || '小白龙'
   const selfSnapshot = computeSelfSnapshot({ conversationWindow, actionLog, agentName })
+
+  // Memory-Optimization v0.1 Phase 0：记录这一轮召回的"命中了什么/漏了什么"。
+  // 写入 best-effort；任何失败都吞掉，绝不影响主流程。
+  // chosen_count = 经过 rerank + topK 截断后真正进 prompt 的条数（含 recall hits）；
+  // matched_mem_ids 取真正进 prompt 的那批，便于后续核对"prompt 里到底带了哪些记忆"。
+  try {
+    const chosenIds = [
+      ...memories.map(m => m.mem_id || m.id),
+      ...recallMemories.map(m => m.mem_id || m.id),
+    ]
+    const dist = {}
+    for (const m of memories) {
+      const et = m.event_type || 'unknown'
+      dist[et] = (dist[et] || 0) + 1
+    }
+    insertRecallAudit({
+      turn_label: isTickMessage ? 'L2_TICK' : (senderId ? `L1_msg_from_${senderId}` : 'unknown'),
+      from_id: senderId,
+      channel: null,
+      query_text: messageBody || (isTickMessage ? '[TICK]' : ''),
+      matched_mem_ids: chosenIds,
+      chosen_count: chosenIds.length,
+      event_type_dist: dist,
+      latency_ms: Date.now() - injectorStartedAt,
+      source: 'runInjector',
+    })
+  } catch {}
 
   return {
     memories,

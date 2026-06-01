@@ -566,9 +566,42 @@ function throwIfAborted(signal) {
   throw err
 }
 
+// Closer pattern：短客套尾巴的语义指纹。专门用来识别"主回复发完后又补一条客套话"
+// 这种反 pattern。NUDGE 措辞已经在告诉 LLM 不要这么干（[schemas.js One action, one message]
+// + [llm.js sentMessage nudge]），但中文 LLM 训练里的尾巴反射太强，需要运行时安全网兜底。
+//
+// 判定要保守：宁可漏拦也不要误伤合法短回复（"好的"/"已开"/"下午3点"）。所以同时要求：
+//   1. 长度 <= 30（closer 通常很短）
+//   2. 命中以下任一 pattern（语义明确是客套尾巴，不是实质内容）
+const CLOSER_PATTERNS = [
+  /有(任何|什么)?(需要|问题|事|帮助).{0,8}(叫|找|说|呼|联系|来找|告诉)/,
+  /随时(叫|找|说|呼|联系|来找|问).{0,5}我/,
+  /(希望|但愿).{0,5}(对你|对您|能).{0,5}(帮助|有用|有所帮助)/,
+  /(还有|其他).{0,3}(需要|问题|事|想知道|想了解|要补充|地方需要)/,
+  /为(您|你).{0,5}(效劳|服务)/,
+  /(祝|愿)(你|您|大家|各位).{1,15}/,
+  /(明白|理解|清楚|懂)了?吗[!?！？。\s]*$/,
+  /欢迎.{0,5}(随时|继续).{0,5}(问|交流|沟通|联系)/,
+  /(如|若|要是).{0,3}(还|有|需要).{0,10}(可以|尽管|随时).{0,5}(问|告诉|找|叫)/,
+  /^(feel free|let me know|happy to help|hope.{0,15}help)/i,
+]
+
+function isCloserPattern(content) {
+  const s = String(content || '').trim()
+  if (!s) return false
+  if (s.length > 30) return false
+  return CLOSER_PATTERNS.some(re => re.test(s))
+}
+
 // 主调用：agentic 循环，连续执行工具直到模型停止
 // 返回 { content: string, toolResult: { name, args, result } | null, aborted: bool }
-export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onToolExecute, onStream, onRetry, toolContext = {}, mustReply = false }) {
+//
+// silentSignal: 本轮是否是 silent 系统信号（如 APP_SIGNAL: confirm_security_change /
+//   cancel_security_change / app:saveState 等）。silent turn 本质是"系统在悄悄
+//   refresh agent 的上下文"，**不**期望模型回复用户。当 silentSignal=true 时，
+//   runtime 直接拦截 send_message 调用（不让它真投递），并在工具结果里告知
+//   "本轮是 silent 系统信号，不要 send_message"，让模型从这次拒绝里学到边界。
+export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onToolExecute, onStream, onRetry, toolContext = {}, mustReply = false, silentSignal = false }) {
   const toolSchemas = getToolSchemas(tools)
 
   const messages = Array.isArray(inputMessages) && inputMessages.length > 0
@@ -596,6 +629,14 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   // 跟踪本次 callLLM 调用中实际调过的工具名，用于检测"声称做了 X 但没真的调 X"的 false-claim。
   const calledTools = new Set()
   const toolLoopState = createToolLoopState()
+  // Turn-level send_message 历史：target_id → [{ length, isCloser }]。
+  // 用于 closer dedup 安全网：当 LLM 在已经发过实质消息后又试图补一条短客套尾巴
+  // ("有需要随时叫我"/"希望对你有帮助"/...) 时，运行时直接拦截这次 send_message 调用，
+  // 返回 ok:false 让 LLM 在下一轮看到"你刚才那次 send_message 是 closer，已被合并丢弃"，
+  // 强制它学会一次说完。误判风险通过 isCloserPattern 的保守判定（必须长度<=30 + 匹配明确尾巴
+  // 模式）+ "已发实质消息"前置条件（length>=15 且非 closer）控制——纯短回复"好的"/"已开"
+  // 不命中 pattern，不会被误拦。
+  const turnSendHistory = new Map()
 
   for (let round = 0; round < TOOL_LOOP_LIMITS.maxRounds; round++) {
     throwIfAborted(signal)
@@ -753,6 +794,8 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         console.log(`[工具警告] ${tc.name} 参数为空`)
       }
       let result
+      let closerSuppressed = false
+      let silentSignalSuppressed = false
       if (stopReason) {
         result = makeToolLoopStoppedResult(tc.name, stopReason)
         console.log(`[工具熔断] ${tc.name}: ${stopReason}`)
@@ -761,18 +804,75 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         // 拦截，跨工具死循环仍由 recentFingerprints 的 unique threshold 拦截——安全网未失效。
         toolLoopState.consecutiveFailures = 0
       } else {
-        // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
-        onToolExecute?.(tc.name, normalizedArgs)
-        result = await executeTool(tc.name, normalizedArgs, { ...toolContext, signal })
-        recordToolLoopOutcome(toolLoopState, tc.name, fingerprint, result)
+        // Silent system signal 拦截：本轮是 silent APP_SIGNAL（如 confirm_security_change /
+        //   cancel_security_change / app:saveState 等），系统只是在悄悄 refresh agent 上下文，
+        //   不期望模型回复用户。模型如果违反这个约束调 send_message → 直接拒绝，让它从工具
+        //   结果里学到"silent 信号 = 不需要 send_message"。
+        //   优先于 closer dedup —— silent 拦截范围更广，连实质性消息也拦。
+        if (silentSignal && tc.name === 'send_message') {
+          silentSignalSuppressed = true
+        }
+
+        // Closer dedup 安全网：本 turn 内对同一 target 已发过实质消息（length>=15 且非 closer）
+        // 后，再发"客套尾巴"短消息（命中 CLOSER_PATTERNS）直接拦截，不真正投递。LLM 在下一轮
+        // 看到 ok:false + reason 学到不能这么干，且不累加 consecutiveFailures（这是 by design
+        // 拒绝，不算失败）。判定保守 —— "好的"/"已开"/"下午3点" 都不匹配 CLOSER_PATTERNS。
+        if (!silentSignalSuppressed && tc.name === 'send_message') {
+          const target = normalizedArgs.target_id
+          const content = String(normalizedArgs.content || '')
+          if (target && isCloserPattern(content)) {
+            const history = turnSendHistory.get(target) || []
+            if (history.some(h => !h.isCloser && h.length >= 15)) {
+              closerSuppressed = true
+            }
+          }
+        }
+        if (silentSignalSuppressed) {
+          result = JSON.stringify({
+            ok: false,
+            tool: 'send_message',
+            skipped: 'silent_system_signal',
+            reason: 'This turn was triggered by a silent system signal (e.g. a confirm/cancel from a UI card, or an internal context refresh) — the user is NOT waiting for a reply. The runtime suppressed this send_message. Do not call send_message in silent signal turns; use this turn only to update internal state (memory, focus, task). The user already sees the result through the UI / next time you reply.',
+          })
+          console.log(`[silent signal] 拦截 send_message → ${normalizedArgs.target_id}: ${String(normalizedArgs.content || '').slice(0, 30)}`)
+        } else if (closerSuppressed) {
+          result = JSON.stringify({
+            ok: false,
+            tool: 'send_message',
+            skipped: 'closer_dedup',
+            reason: 'You already sent the main reply to this user in this turn. This second message is a closing pleasantry (e.g. "有需要随时叫我", "希望对你有帮助") with no new information — the runtime suppressed it. Do not split a closer into a second send_message; merge it into the main reply or omit entirely, and end the round.',
+          })
+          console.log(`[closer dedup] 拦截 send_message → ${normalizedArgs.target_id}: ${String(normalizedArgs.content || '').slice(0, 30)}`)
+        } else {
+          // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
+          onToolExecute?.(tc.name, normalizedArgs)
+          result = await executeTool(tc.name, normalizedArgs, { ...toolContext, signal })
+          recordToolLoopOutcome(toolLoopState, tc.name, fingerprint, result)
+        }
       }
       throwIfAborted(signal)
       // sentMessage 语义：最近一次工具动作是否就是 send_message。
       // 任何非 send_message 工具都把它清掉——意味着模型在 send_message 之后又做了新工作，
       // 那之前那次 send_message 只是过场（"好，我去看看…"），还欠用户一次最终回复。
       // 这样 line ~641 的"沉默退出 nudge"才能在该补刀时正确触发。
-      if (tc.name === 'send_message') sentMessage = true
-      else sentMessage = false
+      // 被 closer dedup 拦截的 send_message 也算 sentMessage=true（最后一个动作意图是
+      // 发消息，主回复已经发过——下一轮注入 "默认结束本轮" nudge 是合适的）。
+      if (tc.name === 'send_message') {
+        sentMessage = true
+        // 仅对真实发出的（未被 dedup 拦截的）send_message 记录到 turn 历史，避免被拦截的
+        // closer / silent signal 反过来污染后续判断（已经被拦截的就当没发生）。
+        if (!closerSuppressed && !silentSignalSuppressed) {
+          const target = normalizedArgs.target_id
+          const content = String(normalizedArgs.content || '')
+          if (target) {
+            const history = turnSendHistory.get(target) || []
+            history.push({ length: content.length, isCloser: isCloserPattern(content) })
+            turnSendHistory.set(target, history)
+          }
+        }
+      } else {
+        sentMessage = false
+      }
       calledTools.add(tc.name)
       if (shouldPersistActionLog(tc.name)) {
         insertActionLog({
@@ -859,7 +959,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         messages.push({
           role: 'user',
           content: sentMessage
-            ? `Tool execution results:\n${resultSummary}\n\nMessage sent. If you still need to send additional separate messages, call send_message again now. Otherwise end this round.`
+            ? `Tool execution results:\n${resultSummary}\n\nMessage sent. Default action: end the round now — to end, just stop: emit no further tool call and no text.\n\nDo NOT send a second message just to add a closing pleasantry ("有需要随时叫我", "希望对你有帮助"), a follow-up check ("还有什么需要吗"), or to restate your reply — those are pure noise. Do NOT narrate your decision to stop either: "已经回复过了，不需要再发" / "安静等待" is internal reasoning, not a message — never send it. Only call send_message again if there is genuinely NEW substantive information the user does not yet know.`
             : toolLoopStopReason
               ? buildToolLoopStopNudge(toolLoopStopReason, lastToolResult)
               : `Tool execution results:\n${resultSummary}\n\nContinue completing the task. If this is a user message and the information is sufficient, call send_message to give the user a final reply. If a tool failed, explain the failure and available clues; do not end silently.`,
@@ -897,9 +997,13 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           content: buildToolLoopStopNudge(toolLoopStopReason, lastToolResult),
         })
       } else if (sentMessage) {
+        // 历史措辞 "If you still need to send additional separate messages" 被中文 LLM 解读成
+        // "鼓励多发"，叠加它们训练里的客套尾巴反射（"有需要随时叫我"/"希望对你有帮助"），
+        // 一次 Q&A 经常变成双发。新措辞默认收尾，明确把 closer/followup/复述列为禁止，
+        // 仅保留"工具结果回来后补刀"和"不同收件人"的合法口子。
         messages.push({
           role: 'user',
-          content: 'Message sent. If you still need to send additional separate messages to the user, call send_message again now. Otherwise end this round.',
+          content: 'Message sent. Default action: end the round now — to end, just stop: emit no further tool call and no text.\n\nDo NOT send a second message just to add a closing pleasantry ("有需要随时叫我", "希望对你有帮助", "祝你...好"), a follow-up check ("还有什么需要吗", "明白了吗"), or to restate what you already said. Those are pure noise — the user sees them as filler and the conversation degrades.\n\nAbove all, do NOT narrate your own decision to stop. Lines like "已经和用户打过招呼了，不需要再发第二条" / "安静等待" / "I\'ll stay quiet now" are INTERNAL REASONING, not messages — they belong in your thinking and must never be sent through send_message or written as a reply. If you have decided not to reply, the correct way to express that is to send nothing at all.\n\nOnly call send_message again if you have genuinely NEW substantive information the user does not yet know — e.g., a tool result that came back after your reply and materially changes the answer, or a different recipient that also needs to hear from you.',
         })
       } else if (mustReply) {
         messages.push({

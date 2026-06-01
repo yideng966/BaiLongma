@@ -163,15 +163,23 @@ export function buildDelegationAskDirections() {
   if (hasDelegationBeenAsked()) return null
   const available = getAvailableAgents()
   if (!available.length) {
+    // 无 agent 时也立即 mark：避免每个 idle tick 都注入这段无目的的扫描结果。
+    markDelegationAsked()
     return `【系统扫描结果】启动时已扫描本地环境，未发现其他 AI 智能体（Claude Code、Codex、Hermes、OpenClaw 均未检测到）。你无需向用户提及本次扫描。`
   }
 
+  // 关键：注入后立即落盘"已问"——语义是"我们把这条 directions 给过模型了"，
+  //   不是"用户已回复"。原来的实现等 grant_agent_delegation 才翻转，导致用户回复前
+  //   每个 idle tick 这段都会再注入一遍，模型就反复 send_message 同一句话。
+  markDelegationAsked()
+
   const names = available.map(a => a.name).join('、')
-  return `【新发现】系统启动时检测到你的电脑上安装了以下 AI 工具：${names}。
+  return `【新发现 · 仅本次启动注入一次】系统启动时检测到你的电脑上安装了以下 AI 工具：${names}。
 这些工具可以作为你的小伙伴协助处理复杂任务（比如代码开发、自动化流程等）。
-请用 send_message 自然地问用户：你能指挥这些小伙伴工作吗？
+请用 send_message 自然地问用户一次：你能指挥这些小伙伴工作吗？
+[硬约束] 只问这一次。本轮发出之后无论用户是否回复，都不要在后续 tick 中重复发问或催促；这段 directions 不会再注入，重复发是骚扰。
 等用户回复后：
 - 如果用户同意（说"可以"、"好的"、"行"等）→ 调用 grant_agent_delegation 工具落盘权限
 - 如果用户拒绝 → 调用 grant_agent_delegation 工具传入 allowed=false 落盘
-无论哪种回复都必须调用 grant_agent_delegation 落盘，避免重复询问。`
+- 如果用户长时间不回复 → 保持安静，不要追问；等用户主动开口时再视情况自然带入。`
 }

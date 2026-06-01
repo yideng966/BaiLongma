@@ -436,6 +436,47 @@ function initSchema() {
     );
   `)
 
+  // recall_audit / extract_audit：记忆系统观测层（Phase 0 of Memory-Optimization v0.1）
+  //   recall_audit  : injector 每次召回写一行——给"召回到底命中了什么/漏了什么"留证据
+  //   extract_audit : recognizer 每次抽取写一行——给"哪些 turn 没抽到记忆"留证据
+  // 写入采用 best-effort（try/catch + console.warn），任何写失败都不能影响主流程
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_audit (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+      turn_label      TEXT,
+      from_id         TEXT,
+      channel         TEXT,
+      query_text      TEXT,
+      matched_mem_ids TEXT    NOT NULL DEFAULT '[]',
+      matched_count   INTEGER NOT NULL DEFAULT 0,
+      chosen_count    INTEGER NOT NULL DEFAULT 0,
+      event_type_dist TEXT    NOT NULL DEFAULT '{}',
+      latency_ms      INTEGER,
+      source          TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recall_audit_created_at ON recall_audit(created_at);
+    CREATE INDEX IF NOT EXISTS idx_recall_audit_from_id    ON recall_audit(from_id);
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS extract_audit (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+      turn_label        TEXT,
+      from_id           TEXT,
+      channel           TEXT,
+      turn_summary      TEXT,
+      extracted_mem_ids TEXT    NOT NULL DEFAULT '[]',
+      extracted_count   INTEGER NOT NULL DEFAULT 0,
+      event_type_dist   TEXT    NOT NULL DEFAULT '{}',
+      latency_ms        INTEGER,
+      skipped           INTEGER NOT NULL DEFAULT 0,
+      skip_reason       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_extract_audit_created_at ON extract_audit(created_at);
+    CREATE INDEX IF NOT EXISTS idx_extract_audit_from_id    ON extract_audit(from_id);
+  `)
+
   // 重建 FTS 索引（覆盖已有数据，确保历史记忆也被索引）
   db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`)
 }
@@ -1288,6 +1329,34 @@ export function markConversationOpenQuestion(id, isOpen = true) {
   return info.changes || 0
 }
 
+// 查最近 withinMs 毫秒内 jarvis 发给 toId 的消息中，是否有 content 完全相同的一条。
+// 命中返回 { id, content, timestamp, ageMs }，未命中返回 null。
+// 用途：send_message 防重发——零用户消息状态下，模型常被旧 directions 反复驱动发同一句话。
+export function findRecentJarvisDuplicate(toId, content, withinMs = 300_000) {
+  if (!toId || !content) return null
+  const db = getDB()
+  const normalizedId = normalizeConversationPartyId(toId)
+  const target = String(content).trim()
+  if (!target) return null
+  // 拉最近 20 条做内存比对：5 分钟内 jarvis 不会发到 20 条，比 LIKE 全表扫稳。
+  const rows = db.prepare(`
+    SELECT id, content, timestamp FROM conversations
+    WHERE role = 'jarvis' AND to_id = ?
+    ORDER BY id DESC
+    LIMIT 20
+  `).all(normalizedId)
+  const now = Date.now()
+  for (const r of rows) {
+    const ts = Date.parse(r.timestamp)
+    const ageMs = Number.isFinite(ts) ? now - ts : Infinity
+    if (ageMs > withinMs) break  // 已按 id DESC，再往后只会更老
+    if (String(r.content || '').trim() === target) {
+      return { id: r.id, content: r.content, timestamp: r.timestamp, ageMs }
+    }
+  }
+  return null
+}
+
 // 将最近一条 jarvis 消息内容裁剪为已说出的部分（TTS 被打断时调用）
 export function updateLastJarvisConversationContent(spokenContent) {
   const db = getDB()
@@ -1579,10 +1648,20 @@ export function insertActionLog({
 }
 
 // 获取最近 N 条行动日志（时间正序）
-export function getRecentActionLogs(limit = 50) {
+// 默认排除 source='recognizer'：识别器是后台 housekeeping，不算主 Agent 的"自我历史"。
+// 一旦混进 self-snapshot 的"工具习惯（近 10 次调用）"和 runtime 的 "Recent tool/action log"，
+// 主 Agent 看到自己最近全在 skip_recognition，就会把后续无关问题误读成"用户在问识别器"。
+// 极少数审计/诊断场景需要看全部时，传 { includeRecognizer: true }。
+export function getRecentActionLogs(limit = 50, { includeRecognizer = false } = {}) {
   const db = getDB()
+  if (includeRecognizer) {
+    return db.prepare(`
+      SELECT * FROM action_logs ORDER BY id DESC LIMIT ?
+    `).all(limit).reverse()
+  }
   return db.prepare(`
-    SELECT * FROM action_logs ORDER BY id DESC LIMIT ?
+    SELECT * FROM action_logs WHERE source IS NULL OR source != 'recognizer'
+    ORDER BY id DESC LIMIT ?
   `).all(limit).reverse()
 }
 
@@ -1705,8 +1784,10 @@ export function searchMemories(keyword, limit = 10) {
   if (kw.length < 3) return likeFallback()
 
   try {
+    // 带出 bm25 相关度分（_ftsScore，越小越相关）。供注入器"少即是强"选择器做
+    // 相关度地板过滤用；LIKE 兜底路径无此分（_ftsScore 为 undefined，选择器自动豁免）。
     const hits = db.prepare(`
-      SELECT m.* FROM memories m
+      SELECT m.*, bm25(memories_fts) AS _ftsScore FROM memories m
       JOIN memories_fts ON memories_fts.rowid = m.id
       WHERE memories_fts MATCH ? AND m.${VISIBLE_CLAUSE}
       ORDER BY bm25(memories_fts), m.timestamp DESC
@@ -1762,9 +1843,30 @@ function cosineSimilarity(aBuf, bBuf) {
 // 全表扫描所有有 embedding 的 memories，返回 cosine 相似度 top-N。
 // 输入 queryBuffer：Buffer，包裹 Float32Array。
 // 返回：每条形如 {...memoryRow, _vecScore: number}。
+//
+// Wave 1 优化：scaling 防御 —— 行数超过 VEC_FULL_SCAN_LIMIT 时直接返回 []，
+// 让上层走 FTS5 兜底。理由：纯 JS cosine 在 N×1024 维度下 N>5k 后单次
+// 召回会到几百毫秒，把主路径同步阻塞拖到秒级。当前 DB 实测 0 行 embedding，
+// 这条是预防 embedding-backfill 跑起来后突然变慢的"未来 bug"。
+// 真要支持大表向量召回应接 sqlite-vec 扩展或外部 ANN，此处先保命。
+const VEC_FULL_SCAN_LIMIT = 5000
+
 export function searchByEmbedding(queryBuffer, limit = 20) {
   if (!queryBuffer || !(queryBuffer instanceof Buffer) || queryBuffer.byteLength === 0) return []
   const db = getDB()
+
+  // 上限保护：先 COUNT，超限直接返回。better-sqlite3 + WAL + 索引扫描，几 ms 就回。
+  try {
+    const countRow = db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE embedding IS NOT NULL AND ${VISIBLE_CLAUSE}`).get()
+    if (countRow && countRow.c > VEC_FULL_SCAN_LIMIT) {
+      // 静默跳过，不打 warn——这条会被 inject 链路每条消息都走一次，
+      // 噪声日志反而干扰调试。需要时把这里改成节流日志。
+      return []
+    }
+  } catch {
+    // 老库 schema 未迁移：COUNT 失败 → 走原路径让 SELECT 自己决定 fallback
+  }
+
   let rows
   try {
     // 软隐藏过滤：被隐藏的记忆即使有 embedding 也不参与召回
@@ -1977,3 +2079,135 @@ export function saveFocusStack(stack) {
     console.warn('[focus-persist] saveFocusStack failed:', err.message)
   }
 }
+
+// ───────── 记忆观测层（Memory-Optimization v0.1 Phase 0） ─────────
+// 所有 audit 写入都是 best-effort：失败只记 warn，不抛出，不影响主流程。
+
+export function insertRecallAudit({
+  turn_label = null,
+  from_id = null,
+  channel = null,
+  query_text = '',
+  matched_mem_ids = [],
+  chosen_count = 0,
+  event_type_dist = {},
+  latency_ms = null,
+  source = null,
+} = {}) {
+  try {
+    const ids = Array.isArray(matched_mem_ids) ? matched_mem_ids : []
+    getDB().prepare(`
+      INSERT INTO recall_audit (
+        turn_label, from_id, channel, query_text,
+        matched_mem_ids, matched_count, chosen_count,
+        event_type_dist, latency_ms, source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      turn_label,
+      from_id,
+      channel,
+      (query_text || '').slice(0, 1000),
+      JSON.stringify(ids),
+      ids.length,
+      chosen_count,
+      JSON.stringify(event_type_dist || {}),
+      latency_ms,
+      source
+    )
+  } catch (err) {
+    console.warn('[recall_audit] insert failed:', err.message)
+  }
+}
+
+export function insertExtractAudit({
+  turn_label = null,
+  from_id = null,
+  channel = null,
+  turn_summary = '',
+  extracted_mem_ids = [],
+  event_type_dist = {},
+  latency_ms = null,
+  skipped = false,
+  skip_reason = null,
+} = {}) {
+  try {
+    const ids = Array.isArray(extracted_mem_ids) ? extracted_mem_ids : []
+    getDB().prepare(`
+      INSERT INTO extract_audit (
+        turn_label, from_id, channel, turn_summary,
+        extracted_mem_ids, extracted_count,
+        event_type_dist, latency_ms, skipped, skip_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      turn_label,
+      from_id,
+      channel,
+      (turn_summary || '').slice(0, 500),
+      JSON.stringify(ids),
+      ids.length,
+      JSON.stringify(event_type_dist || {}),
+      latency_ms,
+      skipped ? 1 : 0,
+      skip_reason
+    )
+  } catch (err) {
+    console.warn('[extract_audit] insert failed:', err.message)
+  }
+}
+
+export function getRecentRecallAudits(limit = 50) {
+  try {
+    return getDB().prepare(`SELECT * FROM recall_audit ORDER BY id DESC LIMIT ?`).all(limit)
+  } catch (err) {
+    console.warn('[recall_audit] read failed:', err.message)
+    return []
+  }
+}
+
+export function getRecentExtractAudits(limit = 50) {
+  try {
+    return getDB().prepare(`SELECT * FROM extract_audit ORDER BY id DESC LIMIT ?`).all(limit)
+  } catch (err) {
+    console.warn('[extract_audit] read failed:', err.message)
+    return []
+  }
+}
+
+export function getRecallAuditStats({ sinceIso = null } = {}) {
+  try {
+    const sinceClause = sinceIso ? 'WHERE created_at >= ?' : ''
+    const args = sinceIso ? [sinceIso] : []
+    return getDB().prepare(`
+      SELECT
+        COUNT(*) AS total,
+        AVG(matched_count) AS avg_matched,
+        AVG(chosen_count)  AS avg_chosen,
+        AVG(latency_ms)    AS avg_latency_ms,
+        MAX(latency_ms)    AS max_latency_ms,
+        SUM(CASE WHEN matched_count = 0 THEN 1 ELSE 0 END) AS zero_match_count
+      FROM recall_audit ${sinceClause}
+    `).get(...args)
+  } catch (err) {
+    console.warn('[recall_audit] stats failed:', err.message)
+    return null
+  }
+}
+
+export function getExtractAuditStats({ sinceIso = null } = {}) {
+  try {
+    const sinceClause = sinceIso ? 'WHERE created_at >= ?' : ''
+    const args = sinceIso ? [sinceIso] : []
+    return getDB().prepare(`
+      SELECT
+        COUNT(*)            AS total,
+        AVG(extracted_count) AS avg_extracted,
+        AVG(latency_ms)      AS avg_latency_ms,
+        SUM(skipped)         AS skipped_count
+      FROM extract_audit ${sinceClause}
+    `).get(...args)
+  } catch (err) {
+    console.warn('[extract_audit] stats failed:', err.message)
+    return null
+  }
+}
+

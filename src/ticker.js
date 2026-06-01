@@ -32,7 +32,7 @@ function clampTtl(n) {
   return Math.max(MIN_TTL, Math.min(MAX_TTL, Math.round(n)))
 }
 
-// L2 调节节奏。返回 { ok, seconds, ttl, clampedFrom } 供工具回包
+// L2 调节节奏。返回 { ok, seconds, ttl, clampedFrom, noop? } 供工具回包
 export function setCustomInterval({ seconds, ttl, reason = '' }) {
   const s = clampSeconds(seconds)
   if (s === null) return { ok: false, error: 'seconds 必须是数字' }
@@ -40,6 +40,22 @@ export function setCustomInterval({ seconds, ttl, reason = '' }) {
   const clampedFrom = {}
   if (s !== seconds) clampedFrom.seconds = seconds
   if (t !== ttl) clampedFrom.ttl = ttl
+
+  // Wave 1 优化：idempotent 化。
+  //   实测 log 显示模型每个 TICK 都重复调一次相同参数的 set_tick_interval
+  //   （"节奏已设为 120s，持续 30 轮"），每次都重置 ttl 让节奏永远不衰减，
+  //   同时浪费一轮 LLM。判定：当前已经是相同 intervalMs 且仍在生效（ttl > 0）→ noop。
+  //   ttl 不重置——让自然衰减带模型回到"无定制"状态，避免它自己反复延长。
+  if (state.intervalMs === s * 1000 && state.ttl > 0) {
+    console.log(`[Ticker] 节奏已是 ${s}s（剩 ${state.ttl} 轮），重复调用判为 noop`)
+    return {
+      ok: true,
+      seconds: s,
+      ttl: state.ttl,  // 返回当前剩余，不刷新
+      clampedFrom,
+      noop: true,
+    }
+  }
 
   state.intervalMs = s * 1000
   state.ttl = t

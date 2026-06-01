@@ -1,7 +1,7 @@
 import { config, getMinimaxKey as _getMinimaxKey, getSecurity } from './config.js'
 import { callLLM } from './llm.js'
 import { buildSystemPrompt, buildContextBlock, combinePromptForPreview } from './prompt.js'
-import { runRecognizer } from './memory/recognizer.js'
+import { enqueueTurnForRecognition, configureRecognizerScheduler } from './memory/recognizer-scheduler.js'
 import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards, formatTemporalRecall } from './memory/injector.js'
 import { updateFocusFrame } from './memory/focus.js'
 import { compressPoppedFrame } from './memory/focus-compress.js'
@@ -116,14 +116,15 @@ const EXPLORATION_INDEX_KEY = 'awakening_exploration_index'
 const AWAKENING_EXPLORATION_TASKS = [
   // 1. Read existing memories
   `Exploration (1/2): See what you already know.
-Go through the injected memories and take stock: who do you know, what do you know, are there any threads with no follow-up.
-Do this quietly. If you find something forgotten — something the user mentioned months ago but never brought up again — you can mention it in passing, but do not ask "do you need me to handle it?".
-When done, call ui_show("AwakeningCard", { index:1, total:2, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).`,
+Go through the injected memories silently and take stock: who do you know, what do you know, are there any threads with no follow-up.
+[HARD RULE — DO NOT VIOLATE] During the awakening exploration phase the user has not started a conversation with you yet. Calling send_message to proactively open a topic — including any "casual mention" of memories you uncovered — is forbidden. Record findings only in the AwakeningCard below; do not turn them into outbound messages.
+When done, call ui_show("AwakeningCard", { index:1, total:2, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).
+If later the user opens a conversation and the topic is relevant, you may bring the finding in then — not before.`,
 
   // 2. Surface an unfinished thread
   `Exploration (2/2): Find a forgotten thread.
-Look through memories — what did the user mention before but never bring up again? A plan, an idea, something they said they wanted to do but never did?
-If you find one, bring it up casually. Do not ask "do you need me to move this forward?" — just mention it and see how they react.
+Look through memories silently — what did the user mention before but never bring up again? A plan, an idea, something they said they wanted to do but never did?
+[HARD RULE — DO NOT VIOLATE] Same as Task 1: send_message is forbidden during awakening exploration. Do not "casually bring it up". Do not ask "do you need me to move this forward?". Do not draft an opening line to the user. The thread, if found, lives only in the AwakeningCard finding field; it waits for the user to start the conversation.
 When done, call ui_show("AwakeningCard", { index:2, total:2, title:"Unfinished thread", finding:"(one sentence describing the forgotten thread, or 'no open threads found')", emoji:"🔍" }).`,
 ]
 
@@ -194,6 +195,13 @@ const state = {
 }
 
 const TASK_IDLE_TICK_LIMIT = 5  // auto-clear task after N consecutive task ticks with no tool calls
+
+// 识别器去抖调度：批量 recognizer 完成后照常广播 memories_written（按批，count 为该批写入总数）
+configureRecognizerScheduler({
+  onResult: (memories) => {
+    emitEvent('memories_written', { count: memories?.length || 0, memories: memories || [] })
+  },
+})
 
 function summarizeToolCall(t = {}) {
   const args = t.args || {}
@@ -721,17 +729,20 @@ async function runTurn(input, label, msg = null) {
     // 1b. Focus stack —— 动态上下文记忆池第 3b/3c 步：多帧栈 + 压缩回填
     // 在 runInjector 之后、buildContextBlock 之前更新，让 <focus> / <focus-history> 段拿到最新栈。
     try {
-      // Focus classifier 策略（Step 6a 重构）：
+      // Focus classifier 策略（Wave 1 优化：全路径 async）：
       //   - 始终启用 LLM 仲裁（除非用户显式关掉 state.focusClassifierDisabled）
-      //   - fastUserPath: async 模式 —— v0 同步建帧零延迟，LLM 后台 patch refined topic
-      //   - 后台路径（TICK/background）: sync 模式 —— 不在乎多 800ms，让 LLM 在主上下文构建前就 refine
+      //   - 所有路径都走 async：v0 同步建帧零延迟，LLM 后台 patch refined topic
+      //   - 历史上 TICK/background 走 sync 是想让 LLM 在主上下文构建前就 refine 一次
+      //     但 log 显示 800ms 硬超时常发，回退到 v0 等于"白等 800ms"
+      //   - async 不改栈结构、只 patch topic，当前轮看 v0 ngram，下一轮看 refined
+      //     代价小（焦点信号粗 1 轮），收益大（TICK 路径砍掉 800ms）
       //   - LLM 失败/超时/解析失败：focus-classifier 内部打日志后回退 v0，绝不阻塞主流程
       const classifierDisabled = state.focusClassifierDisabled === true
       const focusResult = await updateFocusFrame(state, input, {
         isTick,
         tickCounter: state.tickCounter || 0,
         classifierEnabled: !classifierDisabled,
-        classifierMode: fastUserPath ? 'async' : 'sync',
+        classifierMode: 'async',
         onClassifierRefined: () => {
           // async 模式 LLM 回填 topic 后保存到 db，让下次启动恢复时也能拿到 refined topic
           try {
@@ -931,10 +942,21 @@ async function runTurn(input, label, msg = null) {
     // 真正命中。currentTime / existenceDesc / systemEnv / security 改走 <runtime> 段（每轮变化）。
     // P1：把当前 user 消息正文传给 buildSystemPrompt，让 agent registry 块按需注入
     //   （只在用户明确提到 Claude Code/Codex/Hermes 等外部 agent 时才出现）。
+    // Wave 2：把 channel / geo / focus 信号一起传过去，让 8 段场景规则按需注入。
+    // TODO: Wave 2 后续接入 —— hasWechatHistory 暂时按 false 传（需要查 conversations 表
+    //   看当前 user 是否有 WECHAT 历史；目前依赖 currentChannel === 'WECHAT' 来触发）。
+    // TODO: Wave 2 后续接入 —— hasActiveFocus 暂时按 false 传（需要把 focus banner active
+    //   状态做进 state，目前依赖 keyword 触发）。
     const systemPrompt = buildSystemPrompt({
       agentName,
       persona,
       userMessage: msg?.content || input || '',
+      currentChannel: msg ? normalizeChannel(msg.channel || '') : '',
+      hasWechatHistory: false,
+      hasActiveFocus: false,
+      currentCountryCode: geoResult?.location?.country_code || '',
+      currentTimezone: geoResult?.location?.timezone || '',
+      currentTools: injection.tools || [],
     })
 
     const baseContextArgs = {
@@ -985,6 +1007,7 @@ async function runTurn(input, label, msg = null) {
       taskSteps: state.taskSteps,
       batteryBlock: getBatteryBlock(),
       currentTopic: currentTopicStr,
+      isTick,
     })
 
     let llmMessages = buildMessagesWithContext(contextBlock)
@@ -1037,15 +1060,21 @@ async function runTurn(input, label, msg = null) {
     const toolContext = buildToolContextForProcess(msg, injection)
     const voiceTurn = isVoiceChannel(msg?.channel)
     const turnTools = resolveTurnTools(injection.tools, { silentSignal })
+    // thinking 始终开启：不再用"消息是否 trivial"的正则判定来关 reasoning。
+    // 浅层模式不该替模型决定"这题不用想"——复合意图下会把需要 reasoning 的部分误杀。
+    // 真正 trivial 的问题，模型开着 thinking 也会几乎瞬间收尾（深度由模型自控）；
+    // trivial 的延迟优化交给 prefix cache + focus 分类的 async 后台化，而非削能力。
     llmResult = await callLLM({
       systemPrompt,
       message: input,
       messages: llmMessages,
       tools: turnTools,
       temperature: voiceTurn ? Math.min(config.temperature, 0.35) : config.temperature,
+      thinking: true,
       signal: controller.signal,
       toolContext,
       mustReply: !!msg?.fromId && !silentSignal,
+      silentSignal,
       onToolCall: (name, args, result) => {
         const resultText = String(result)
         let ok = true
@@ -1234,17 +1263,15 @@ async function runTurn(input, label, msg = null) {
     return
   }
 
-  runRecognizer({
+  // 去抖批处理：把本轮排进识别队列，由 scheduler 决定何时合并成一次批量 recognizer 调用
+  // （空闲/攒满/超时/用过耐久信息工具时 flush）。不再每轮一次 LLM 调用。
+  enqueueTurnForRecognition({
     userMessage: input,
     jarvisThink,
     jarvisResponse: jarvisText,
     toolCallLog,
     task: state.task,
     sessionRef,
-  }).then(memories => {
-    emitEvent('memories_written', { count: memories?.length || 0, memories: memories || [] })
-  }).catch(err => {
-    console.error('[recognizer] Background run failed:', err)
   })
 }
 

@@ -238,6 +238,53 @@ body {
   margin-bottom: 14px;
 }
 
+/* ── AI 当前活动状态：纯文本流，颜色区分忙/闲，无卡片无边框 ── */
+.ai-activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  margin-bottom: 12px;
+  color: var(--muted, color-mix(in srgb, var(--cool) 60%, transparent));
+  letter-spacing: 0.02em;
+}
+
+.ai-activity-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--cool) 35%, transparent);
+  flex: none;
+}
+
+.ai-activity[data-state="busy"] {
+  color: var(--cool);
+}
+
+.ai-activity[data-state="busy"] .ai-activity-dot {
+  background: var(--cool);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--cool) 60%, transparent);
+  animation: ai-activity-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes ai-activity-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.ai-activity-label {
+  flex: none;
+}
+
+.ai-activity-detail {
+  flex: 1;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── 专注帧观察面板 (focus stack) ─────────────────────────────── */
 .focus-block {
   padding-bottom: 14px;

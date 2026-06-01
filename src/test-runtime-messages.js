@@ -106,6 +106,21 @@ const fallbackMessages = buildLLMMessages({
 assertEqual(fallbackMessages.length, 2, 'fallback path has system + one user message')
 assert(fallbackMessages[1].content.startsWith('<context>TICK</context>'), 'fallback user message gets context prefix')
 assert(fallbackMessages[1].content.includes('TICK 2026-05-25-10:03:00'), 'fallback user message keeps input')
+assert(!fallbackMessages[1].content.includes('[heartbeat tick'), 'fallback without isTick stays unmarked (non-tick callers unaffected)')
+
+const tickMessages = buildLLMMessages({
+  systemPrompt: 'SYS',
+  contextBlock: '<context>TICK</context>',
+  conversationWindow: [],
+  input: 'TICK 2026-05-25-10:03:00',
+  isTick: true,
+})
+assertEqual(tickMessages.length, 2, 'tick path has system + one user message')
+assertEqual(tickMessages[1].role, 'user', 'tick fallback uses user role')
+assert(tickMessages[1].content.startsWith('<context>TICK</context>'), 'tick fallback gets context prefix')
+assert(tickMessages[1].content.includes('[heartbeat tick · no new user message]'), 'tick fallback carries heartbeat marker')
+assert(tickMessages[1].content.includes('NOT a user message'), 'tick fallback tells the model this is not a user message')
+assert(tickMessages[1].content.includes('TICK 2026-05-25-10:03:00'), 'tick fallback preserves the tick payload')
 
 const systemSignal = formatConversationMessage({
   role: 'user',

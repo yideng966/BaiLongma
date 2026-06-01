@@ -4,6 +4,7 @@ const TOOL_RISK = {
   read_file: 'low',
   list_dir: 'low',
   search_memory: 'low',
+  probe_memory: 'low',
   list_processes: 'low',
   skip_recognition: 'low',
   send_message: 'medium',

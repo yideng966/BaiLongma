@@ -29,6 +29,14 @@ const createPrimaryPanel = () => `
     <span class="pill" id="pill-l1">实时</span>
   </div>
 
+  <!-- AI 当前正在做什么：纯派生展示，从 tool_call 事件流自动归类，AI 不需要做任何额外动作。
+       北极星：通信问题靠界面侧派生可视化解决，不逼 AI 学人开口。 -->
+  <div class="ai-activity" id="ai-activity">
+    <span class="ai-activity-dot" id="ai-activity-dot"></span>
+    <span class="ai-activity-label" id="ai-activity-label">空闲</span>
+    <span class="ai-activity-detail" id="ai-activity-detail"></span>
+  </div>
+
   ${createVoicePanel()}
 
   <div class="legend" id="legend"></div>
@@ -93,6 +101,14 @@ const createSecondaryPanel = () => `
     <div class="stat">
       <span class="stat-label">tok/s</span>
       <div class="stat-value" id="tok-rate">—</div>
+    </div>
+    <div class="stat" id="mem-recall-stat" title="近 1 小时记忆召回次数 / 平均拉取条数。点击查看明细">
+      <span class="stat-label">召回/h</span>
+      <div class="stat-value" id="mem-recall-rate">—</div>
+    </div>
+    <div class="stat" id="mem-extract-stat" title="近 1 小时记忆抽取次数 / 平均写入条数。点击查看明细">
+      <span class="stat-label">抽取/h</span>
+      <div class="stat-value" id="mem-extract-rate">—</div>
     </div>
   </header>
 

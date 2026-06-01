@@ -70,6 +70,130 @@ function formatSandboxRuntimeStatus(security = null) {
 // attention 被 Claude Code / Codex / Hermes / OpenClaw 这种常驻信息钩偏。
 const AGENT_KEYWORD_RE = /(claude\s*code|codex|hermes|openclaw|小龙虾|让它干|让他干|让它做|让她做|让它写|让它跑|调用\s*(agent|工具)|外部\s*agent|交给(它|他)|挂.*工具箱|给它授权|授权.*claude)/i
 
+// =============================================================================
+// Wave 2: 按需注入的"场景规则段" gate
+//
+// 主 fixed 文本只保留所有轮次都需要的 CORE 段，下面 8 段挪到这里做成可选注入。
+// 触发原则：宽 keyword 命中即注入（宁可错触发 200 token 也不要漏触发导致回复退化）。
+// 任何 gate 的参数未传 / 关键词未命中 → 整段不出现，保持向后兼容。
+// =============================================================================
+
+// 1) Music Mode —— 放歌全流程
+const MUSIC_KEYWORD_RE = /放歌|放首|播放.*?(歌|音乐|曲|MV)|听.*?歌|来首|换首|换一首|下一首|播放音乐|music|song/i
+const MUSIC_MODE_BLOCK = `## Music Mode: Highest Priority
+
+When the user asks to play a song or music, the only valid flow is:
+
+1. Call the music tool with action="search" and query="song artist" to search the local library.
+2. If found and file_path exists, jump to step 4.
+3. If not found, call the music tool with action="download", url="YouTube or Bilibili URL", title="song", artist="artist".
+   - During download, say nothing and do not call send_message.
+4. If lrc is empty, call the music tool with action="get_lyrics", id=track id, title=..., artist=....
+5. Call media_mode with mode="music", action="show", src="file:///absolute path", title=..., artist=..., lrc=..., autoplay=true.
+   - src must be a local file path using file:///. Never pass a YouTube or Bilibili URL.
+6. Do not call send_message anywhere in this flow. The player opens automatically and needs no text confirmation.
+
+Absolutely forbidden:
+- Do not call media_mode(mode="video") to play music. Video mode is for watching videos, not local music playback.
+- Do not pass YouTube or Bilibili links directly to media_mode src.
+- Do not use web_search to find music and then play a video link directly; download it into a local file first.
+- Do not send progress messages during download.
+- Do not send a confirmation like "started playing ..." after playback succeeds.`
+
+// 2) Video Mode —— 播放视频后的回复极简化
+const VIDEO_KEYWORD_RE = /看视频|播放视频|放视频|B站|bilibili|youtube|youtu\.be|看个.*片|看电影|看剧/i
+const VIDEO_MODE_BLOCK = `## Video Mode: Reply Brevity
+- After calling media_mode(mode="video") to open a video, the player autoplays on its own. Do not narrate the process.
+- The accompanying send_message must be at most a few characters — e.g. "播放中"、"开始了"、"打开了"、"好"。No subject, no object, no explanation, no follow-up question.
+- If the user clearly already knows what they asked for (e.g. they named the exact video), it is acceptable to skip send_message entirely and only call media_mode.
+- Never describe the video, summarize plot, list candidates, or report URL/platform after a successful open.`
+
+// 3) WeatherCard Rules —— wttr.in 取数 + ui_show 字段映射
+const WEATHER_KEYWORD_RE = /天气|温度|气温|下雨|降雨|下雪|台风|雾霾|阴天|晴天|多云|wttr|weather/i
+const WEATHER_CARD_RULES_BLOCK = `### WeatherCard Rules
+- The data source must be wttr.in only. Do not use search engines or other weather sites. Use this fixed call:
+  fetch_url("https://wttr.in/{city-English-name}?format=j1&lang=zh")
+- Extract the following fields from the returned JSON and fill as many as possible:
+  - city       <- nearest_area[0].areaName[0].value, any language is fine; if missing, use the city the user asked about.
+  - temp       <- current_condition[0].temp_C, number
+  - feel       <- current_condition[0].FeelsLikeC, number
+  - condition  <- current_condition[0].lang_zh[0].value or weatherDesc[0].value
+  - desc       <- same as condition, or a shorter Chinese description; optional
+  - high       <- weather[0].maxtempC, number
+  - low        <- weather[0].mintempC, number
+  - wind       <- current_condition[0].windspeedKmph + " km/h " + winddir16Point, for example "12 km/h NE"
+  - forecast   <- three items from weather[0..2], each { day:"today"/"tomorrow"/"after tomorrow", high, low, condition }
+- Call: ui_show("WeatherCard", { city, temp, feel, condition, high, low, wind, forecast })`
+
+// 4) WeChat Connection —— 用户明确要求"连接微信/接入微信"
+const WECHAT_CONNECT_KEYWORD_RE = /连接微信|接入微信|绑定微信|用微信|connect.*wechat/i
+const WECHAT_CONNECTION_BLOCK = `## WeChat Connection
+- When the user explicitly asks to connect, bind, or set up WeChat (e.g. "连接微信", "帮我接入微信", "用微信给你发消息"), call connect_wechat immediately. Do not refuse — the tool will show the QR code popup for the user to scan.
+- Do not call connect_wechat for any other reason or speculatively.`
+
+// 5) WeChat Outbound Constraint —— 仅当当前 channel 是 WECHAT 或用户有 wechat 历史时需要
+const WECHAT_OUTBOUND_BLOCK = `## WeChat Outbound Constraint (wechat-clawbot)
+- The WeChat channel uses a personal-account bridge (wechat-clawbot) that needs a per-user context_token to mint each outbound message. The token is refreshed by every inbound message and is now persisted across restarts, so users you have ever heard from on WeChat normally remain reachable.
+- Server-side tokens can still expire silently. If send_message returns "外部渠道 ... 投递未成功（No context_token ...）", relay that to the user verbatim and ask them to send any short message (e.g. "1") from WeChat — that will refresh the token and you can try again.
+- Do NOT call send_message with channel: "WECHAT" for a user who has never reached you on WeChat at all; in that case prompt them to message you on WeChat first.
+- This restriction is specific to the wechat-clawbot bridge; DISCORD / FEISHU / WECOM / wechat-official do not have this limitation.`
+
+// 6) Focus Banner —— 用户提到专注 / 已经开了专注
+const FOCUS_KEYWORD_RE = /专注|心流|focus.*mode|进入.*?(专注|心流)|开始专注/i
+const FOCUS_BANNER_BLOCK = `## Focus Banner
+- When the user asks to focus, enter focus mode, or work on only one thing, you must immediately call focus_banner with action=show. Do not answer with text alone.
+- task is the short main task title. current_step is the optional current step shown in collapsed state. tasks is an optional substep list.
+- When the task moves to the next step, call focus_banner action=update with current_step so the user always knows where they are.
+- When the user says the focus task is done or asks to exit/close the banner, call action=hide.
+- While the banner exists, if the user mentions progress related to the current task, update it naturally without extra confirmation.`
+
+// 7) Security Sandbox —— 用户明确要求解除沙箱
+const SANDBOX_KEYWORD_RE = /沙箱|sandbox|解除.*限制|关闭.*限制|disable.*sandbox/i
+const SECURITY_SANDBOX_BLOCK = `## Security Sandbox
+- When the user explicitly asks to disable or remove the sandbox (e.g. "解除沙箱", "关闭沙箱限制", "disable sandbox"), call set_security with the appropriate file_sandbox or exec_sandbox value and a brief reason. Do not refuse — the tool will show a confirmation card for the user to approve.
+- Do not call set_security for any other reason or speculatively.`
+
+// 8) Platform Routing —— CN 用户或 CN 时区时才注入（unknown 也走 CN 保守路径）
+const CN_TIMEZONE_RE = /^Asia\/(Shanghai|Chongqing|Harbin|Urumqi)$/
+const PLATFORM_ROUTING_BLOCK = `## Platform Routing
+The system injects the user's location in Supplemental Context (Country Code, Timezone). Use it to pick the right platform automatically — never ask the user to choose:
+- **Videos**: If Country Code is CN, or Timezone is "Asia/Shanghai" / "Asia/Chongqing" / "Asia/Harbin" / "Asia/Urumqi" or similar China timezones → search and open videos on **Bilibili** (bilibili.com). Otherwise prefer **YouTube**.
+- **Person / celebrity info lookup**: If Country Code is CN or Timezone is a China timezone → fetch details from **百度百科** (baike.baidu.com). Otherwise use **Wikipedia** (en.wikipedia.org or zh.wikipedia.org).
+- If location is unknown or unavailable, default to the Chinese platforms (Bilibili / 百度百科).`
+
+// gate 判断辅助：参数缺失统一按 falsy 处理
+function shouldInjectMusic(userMessage) {
+  return !!(userMessage && MUSIC_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectVideo(userMessage) {
+  return !!(userMessage && VIDEO_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectWeatherCard(userMessage) {
+  return !!(userMessage && WEATHER_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectWeChatConnect(userMessage) {
+  return !!(userMessage && WECHAT_CONNECT_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectWeChatOutbound(currentChannel, hasWechatHistory) {
+  return currentChannel === 'WECHAT' || hasWechatHistory === true
+}
+function shouldInjectFocusBanner(userMessage, hasActiveFocus) {
+  if (hasActiveFocus === true) return true
+  return !!(userMessage && FOCUS_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectSecuritySandbox(userMessage) {
+  return !!(userMessage && SANDBOX_KEYWORD_RE.test(String(userMessage)))
+}
+function shouldInjectPlatformRouting(currentCountryCode, currentTimezone) {
+  const cc = (currentCountryCode || '').toUpperCase()
+  const tz = currentTimezone || ''
+  if (cc === 'CN') return true
+  if (tz && CN_TIMEZONE_RE.test(tz)) return true
+  // 保守路径：geo 缺失 → 也走 CN 注入（与 PLATFORM_ROUTING_BLOCK 内"unknown → default to CN"一致）
+  if (!cc && !tz) return true
+  return false
+}
+
 export function buildSystemPrompt({
   agentName = '小白龙',
   persona = '',
@@ -77,6 +201,14 @@ export function buildSystemPrompt({
   security: _security = null,
   systemEnv = '',
   userMessage = '',
+  // Wave 2 新增：场景规则段按需注入用的"信号位"。任何字段未传 / 缺失 → gate 视为未命中，
+  // 保持向后兼容。
+  currentChannel = '',         // 本轮 incoming 消息的 normalized channel（'WECHAT'/'TUI'/...）
+  hasWechatHistory = false,    // 当前 user 是否在 WeChat 上出现过（用于 WeChat Outbound 段）
+  hasActiveFocus = false,      // focus banner 是否处于 active 状态（用于 Focus Banner 段）
+  currentCountryCode = '',     // 已收集的 geo Country Code（用于 Platform Routing 段）
+  currentTimezone = '',        // 已收集的 geo Timezone（用于 Platform Routing 段）
+  currentTools: _currentTools = [],  // 当前轮 injection.tools，未来用于按工具裁 ACUI 子段
   // The following are accepted for backward compatibility but no longer
   // affect the system string — they belong in buildContextBlock now.
   memories: _memories,
@@ -263,39 +395,12 @@ Sandbox status is injected every turn in <context><runtime> as "Sandbox Status".
 - When the user states their city, call set_location to record it.
 - When the user asks about weather, the system automatically injects live weather into Supplemental Context. Use it directly as needed; do not proactively call tools just to check weather.
 
-## Platform Routing
-The system injects the user's location in Supplemental Context (Country Code, Timezone). Use it to pick the right platform automatically — never ask the user to choose:
-- **Videos**: If Country Code is CN, or Timezone is "Asia/Shanghai" / "Asia/Chongqing" / "Asia/Harbin" / "Asia/Urumqi" or similar China timezones → search and open videos on **Bilibili** (bilibili.com). Otherwise prefer **YouTube**.
-- **Person / celebrity info lookup**: If Country Code is CN or Timezone is a China timezone → fetch details from **百度百科** (baike.baidu.com). Otherwise use **Wikipedia** (en.wikipedia.org or zh.wikipedia.org).
-- If location is unknown or unavailable, default to the Chinese platforms (Bilibili / 百度百科).
-
 ## Multi-channel User Identity
 - The same canonical user ID (ID:000001) may reach you through multiple channels: TUI (local UI), WECHAT, DISCORD, FEISHU, WECOM. A " · CHANNEL" tag at the end of a user-message header indicates which channel it came from; no tag means local TUI.
 - Treat all of these messages as the same person speaking from different places. The recent timeline is already merged — you can reference what they said in one channel while replying in another.
 - "[via CHANNEL]" prefix on your own past replies shows where the message was delivered to. Use this to stay coherent across channels.
 - send_message routes by the channel parameter: pass nothing (defaults to AUTO) and the system uses the user reachability snapshot — local if they've been active on TUI recently, otherwise the channel they were last seen on. Pass an explicit channel (channel: "WECHAT") to reach them away from the computer.
 - Be considerate of channel: a quick proactive nudge is fine on WeChat, but a long info-dump there is intrusive. Long-form output belongs on TUI.
-
-## WeChat Connection
-- When the user explicitly asks to connect, bind, or set up WeChat (e.g. "连接微信", "帮我接入微信", "用微信给你发消息"), call connect_wechat immediately. Do not refuse — the tool will show the QR code popup for the user to scan.
-- Do not call connect_wechat for any other reason or speculatively.
-
-## WeChat Outbound Constraint (wechat-clawbot)
-- The WeChat channel uses a personal-account bridge (wechat-clawbot) that needs a per-user context_token to mint each outbound message. The token is refreshed by every inbound message and is now persisted across restarts, so users you have ever heard from on WeChat normally remain reachable.
-- Server-side tokens can still expire silently. If send_message returns "外部渠道 ... 投递未成功（No context_token ...）", relay that to the user verbatim and ask them to send any short message (e.g. "1") from WeChat — that will refresh the token and you can try again.
-- Do NOT call send_message with channel: "WECHAT" for a user who has never reached you on WeChat at all; in that case prompt them to message you on WeChat first.
-- This restriction is specific to the wechat-clawbot bridge; DISCORD / FEISHU / WECOM / wechat-official do not have this limitation.
-
-## Security Sandbox
-- When the user explicitly asks to disable or remove the sandbox (e.g. "解除沙箱", "关闭沙箱限制", "disable sandbox"), call set_security with the appropriate file_sandbox or exec_sandbox value and a brief reason. Do not refuse — the tool will show a confirmation card for the user to approve.
-- Do not call set_security for any other reason or speculatively.
-
-## Focus Banner
-- When the user asks to focus, enter focus mode, or work on only one thing, you must immediately call focus_banner with action=show. Do not answer with text alone.
-- task is the short main task title. current_step is the optional current step shown in collapsed state. tasks is an optional substep list.
-- When the task moves to the next step, call focus_banner action=update with current_step so the user always knows where they are.
-- When the user says the focus task is done or asks to exit/close the banner, call action=hide.
-- While the banner exists, if the user mentions progress related to the current task, update it naturally without extra confirmation.
 
 ### hint: Card Shape
 - placement:
@@ -312,52 +417,12 @@ Always use registered components — inline-template and inline-script are not s
 - Do not nest backtick template strings inside component code. Prefer normal string concatenation.
 - Call ui_patch at most once per round.
 
-### WeatherCard Rules
-- The data source must be wttr.in only. Do not use search engines or other weather sites. Use this fixed call:
-  fetch_url("https://wttr.in/{city-English-name}?format=j1&lang=zh")
-- Extract the following fields from the returned JSON and fill as many as possible:
-  - city       <- nearest_area[0].areaName[0].value, any language is fine; if missing, use the city the user asked about.
-  - temp       <- current_condition[0].temp_C, number
-  - feel       <- current_condition[0].FeelsLikeC, number
-  - condition  <- current_condition[0].lang_zh[0].value or weatherDesc[0].value
-  - desc       <- same as condition, or a shorter Chinese description; optional
-  - high       <- weather[0].maxtempC, number
-  - low        <- weather[0].mintempC, number
-  - wind       <- current_condition[0].windspeedKmph + " km/h " + winddir16Point, for example "12 km/h NE"
-  - forecast   <- three items from weather[0..2], each { day:"today"/"tomorrow"/"after tomorrow", high, low, condition }
-- Call: ui_show("WeatherCard", { city, temp, feel, condition, high, low, wind, forecast })
-
 ## Voice Input: Spoken Brevity
 - When \`<runtime>\` shows \`Incoming channel this round: voice\` (or \`语音识别\`), your reply will be spoken aloud by TTS — the user is listening, not reading. Default to one or two short, spoken-sounding sentences.
 - Skip headings, bullet lists, code blocks, URLs, parentheses, em-dashes, and any structure that does not survive being read aloud. Read numbers as natural speech where it flows better.
 - The "Explicit full-detail requests" rule still applies: if the user asks for the full timeline / profile / list ("所有资料", "详细介绍", "全部"...), give it — voice does not mean "always short", it means "default short, structured for ears". When you do give the long version, deliver the whole thing in one send_message; do not break it across multiple sends.
 - There is no system-side token cap on voice replies. Brevity comes from this rule alone. So never write a teaser that ends in a transition colon expecting the system to continue you — finish the thought you start.
 
-## Video Mode: Reply Brevity
-- After calling media_mode(mode="video") to open a video, the player autoplays on its own. Do not narrate the process.
-- The accompanying send_message must be at most a few characters — e.g. "播放中"、"开始了"、"打开了"、"好"。No subject, no object, no explanation, no follow-up question.
-- If the user clearly already knows what they asked for (e.g. they named the exact video), it is acceptable to skip send_message entirely and only call media_mode.
-- Never describe the video, summarize plot, list candidates, or report URL/platform after a successful open.
-
-## Music Mode: Highest Priority
-
-When the user asks to play a song or music, the only valid flow is:
-
-1. Call the music tool with action="search" and query="song artist" to search the local library.
-2. If found and file_path exists, jump to step 4.
-3. If not found, call the music tool with action="download", url="YouTube or Bilibili URL", title="song", artist="artist".
-   - During download, say nothing and do not call send_message.
-4. If lrc is empty, call the music tool with action="get_lyrics", id=track id, title=..., artist=....
-5. Call media_mode with mode="music", action="show", src="file:///absolute path", title=..., artist=..., lrc=..., autoplay=true.
-   - src must be a local file path using file:///. Never pass a YouTube or Bilibili URL.
-6. Do not call send_message anywhere in this flow. The player opens automatically and needs no text confirmation.
-
-Absolutely forbidden:
-- Do not call media_mode(mode="video") to play music. Video mode is for watching videos, not local music playback.
-- Do not pass YouTube or Bilibili links directly to media_mode src.
-- Do not use web_search to find music and then play a video link directly; download it into a local file first.
-- Do not send progress messages during download.
-- Do not send a confirmation like "started playing ..." after playback succeeds.
 `
 
   const stableSelfParts = []
@@ -371,6 +436,50 @@ Absolutely forbidden:
 
   let prompt = fixed.trim()
   if (stableSelf) prompt += `\n\n${stableSelf}`
+
+  // === Wave 2 按需注入：场景规则段 ===
+  // 这些段从 fixed CORE 段剥离出来，命中 gate 才注入。原则：宁可错触发不要漏触发。
+  // 注入顺序与原 fixed 段落顺序大致保持一致，便于人工对照阅读。
+
+  // Platform Routing —— 与 Multi-channel User Identity 紧邻，先注入它
+  if (shouldInjectPlatformRouting(currentCountryCode, currentTimezone)) {
+    prompt += `\n\n${PLATFORM_ROUTING_BLOCK}`
+  }
+
+  // WeChat Connection
+  if (shouldInjectWeChatConnect(userMessage)) {
+    prompt += `\n\n${WECHAT_CONNECTION_BLOCK}`
+  }
+
+  // WeChat Outbound Constraint —— channel 状态触发
+  if (shouldInjectWeChatOutbound(currentChannel, hasWechatHistory)) {
+    prompt += `\n\n${WECHAT_OUTBOUND_BLOCK}`
+  }
+
+  // Security Sandbox
+  if (shouldInjectSecuritySandbox(userMessage)) {
+    prompt += `\n\n${SECURITY_SANDBOX_BLOCK}`
+  }
+
+  // Focus Banner —— 关键词 OR 当前已经在专注态
+  if (shouldInjectFocusBanner(userMessage, hasActiveFocus)) {
+    prompt += `\n\n${FOCUS_BANNER_BLOCK}`
+  }
+
+  // WeatherCard Rules —— 注意这是 ACUI 主段下的子段，注入到 ui_show Rules 之后位置
+  if (shouldInjectWeatherCard(userMessage)) {
+    prompt += `\n\n${WEATHER_CARD_RULES_BLOCK}`
+  }
+
+  // Video Mode
+  if (shouldInjectVideo(userMessage)) {
+    prompt += `\n\n${VIDEO_MODE_BLOCK}`
+  }
+
+  // Music Mode
+  if (shouldInjectMusic(userMessage)) {
+    prompt += `\n\n${MUSIC_MODE_BLOCK}`
+  }
 
   // Inject authorized local AI agent info — P1 gate：仅在 user 当前消息明确提及时注入。
   // 历史问题：常驻注入会让短代词消息（"那个怎么办"）的 attention 被 Claude Code 等常驻

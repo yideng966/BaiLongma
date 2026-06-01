@@ -26,6 +26,8 @@
 //
 // 输出：去重后的 tools: string[]
 
+import { getStatus as getTickerStatus } from '../ticker.js'
+
 // ---- 工具分组 ----
 //
 // core：任何场景都注入。ACUI 工具默认带上（白龙马侧 Phase 1 决策，组件少 token 便宜）。
@@ -194,12 +196,19 @@ export function selectTools(ctx = {}) {
 
   const body = (messageBody || '').toLowerCase()
   const out = new Set(CORE_TOOLS)
+  // 被显式抑制的工具名:ActionLog 保活 / installed 列表 / fallback 兜底都要跳过,
+  // 最后一道 delete 兜底,确保不被任何路径加回来。当前唯一用法是跨 turn 抑制 set_tick_interval。
+  const suppressed = new Set()
 
   // 任务控制：有任务 → 全组；没任务 → 仅 set_task（用户能开任务）
   for (const t of (hasTask ? TASK_CTRL_FULL : TASK_CTRL_OPENER)) out.add(t)
 
   // 记忆搜索：跟原行为对齐
   if (senderId || hasRecall || isTick) out.add('search_memory')
+
+  // probe_memory：无副作用的诊断工具，主 agent 想自检"如果现在问 X，会拉到什么"时用。
+  // 跟 search_memory 同一触发条件——任何会需要 search_memory 的场景都可能想用 probe_memory。
+  if (senderId || hasRecall || isTick) out.add('probe_memory')
 
   // 启动自检：这条链路是一次性系统检查，指令里明确要求语音播报、文件读写、热点面板和视频模式。
   if (startupSelfCheckActive) {
@@ -226,8 +235,21 @@ export function selectTools(ctx = {}) {
   if (hits(body, PREFETCH_TRIGGERS) || isTick) {
     for (const t of PREFETCH_TOOLS) out.add(t)
   }
-  if (hits(body, TICKER_TRIGGERS) || isTick) {
+  // Ticker 跨 turn 抑制：用户消息含 ticker 关键词 → 永远注入(用户在主动调度)。
+  // TICK 心跳路径 → 仅在当前没有生效的 custom interval、或剩余 ttl <= 3 时注入。
+  // 已经设过 120s × 15 轮的话,TICK 路径里模型根本看不到这个工具,自然不会反复调。
+  // ttl <= 3 时重新放开,模型如果想延长当前节奏还有机会。
+  // 被抑制的工具进 suppressed,后续 ActionLog 保活也不会把它捞回来。
+  if (hits(body, TICKER_TRIGGERS)) {
     for (const t of TICKER_TOOLS) out.add(t)
+  } else if (isTick) {
+    const tickerStatus = getTickerStatus()
+    const tickerLocked = tickerStatus.active && tickerStatus.ttl > 3
+    if (!tickerLocked) {
+      for (const t of TICKER_TOOLS) out.add(t)
+    } else {
+      for (const t of TICKER_TOOLS) suppressed.add(t)
+    }
   }
   if (hits(body, HOTSPOT_TRIGGERS) || isTick) {
     for (const t of HOTSPOT_TOOLS) out.add(t)
@@ -256,17 +278,19 @@ export function selectTools(ctx = {}) {
   // —— ActionLog 保活 ——
   // 上轮（或最近 10 次）调用过的工具强制带上：跨轮工作流不能因为关键词没命中就断链。
   // 保活只覆盖白龙马的"已知工具"——installed 工具走单独的全注入路径。
+  // 被抑制的工具(如 ticker 跨 turn 抑制下的 set_tick_interval)跳过 —— 否则模型刚调过又被
+  // ActionLog 拉回来,抑制完全失效。
   if (Array.isArray(recentActionLog)) {
     for (const entry of recentActionLog) {
       const name = entry?.tool
-      if (typeof name === 'string' && name) out.add(name)
+      if (typeof name === 'string' && name && !suppressed.has(name)) out.add(name)
     }
   }
 
   // —— 用户安装的扩展工具：永远全注入（用户主动装的不能省） ——
   if (Array.isArray(installedToolNames)) {
     for (const name of installedToolNames) {
-      if (name) out.add(name)
+      if (name && !suppressed.has(name)) out.add(name)
     }
   }
 
@@ -284,6 +308,10 @@ export function selectTools(ctx = {}) {
     for (const t of WEB_TOOLS) out.add(t)
     for (const t of FILESYSTEM_TOOLS) out.add(t)
   }
+
+  // 最后一道兜底:被 suppressed 的工具不论谁加回来都剃掉。
+  // 防御未来扩展时(新分组、新 fallback、新 marketplace 路径)破坏抑制语义。
+  for (const name of suppressed) out.delete(name)
 
   return [...out]
 }

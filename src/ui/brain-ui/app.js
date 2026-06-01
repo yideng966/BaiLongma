@@ -1007,6 +1007,114 @@ let tokenAccum = 0;
 let tokenWindow = Date.now();
 const tokRateEl = document.getElementById("tok-rate");
 
+// 记忆系统观测（Memory-Optimization v0.1 Phase 0）：每 60s 拉一次近 1 小时的 audit stats。
+// 显示"N 次（平均 K 条）"——次数代表系统活跃度，平均条数代表召回/抽取的健康度。
+// 0 命中数会让数字变橙提醒（命中率低 = 可能有召回漏）；纯网络/服务失败保持 — 不告警。
+const memRecallEl = document.getElementById("mem-recall-rate");
+const memExtractEl = document.getElementById("mem-extract-rate");
+
+// ── AI 当前正在做什么：派生展示 ────────────────────────────────
+// 北极星（[[feedback-ai-be-itself]]）：通信问题靠界面侧派生可视化解决，不逼 AI 学人开口。
+// 工作方式：纯被动接收 tool_call 事件流，按工具名归类统计最近 60s 活动，自动推导当前活动标签。
+// AI 完全不需要为此多做任何动作；它只管干活，UI 自己把"在干什么"翻译给用户看。
+const AI_ACTIVITY_WINDOW_MS = 60_000;
+const AI_ACTIVITY_IDLE_AFTER_MS = 15_000;
+const AI_TOOL_GROUPS = {
+  "扫描文件": new Set(["read_file", "list_dir"]),
+  "改动文件": new Set(["write_file", "make_dir", "delete_file"]),
+  "执行命令": new Set(["exec_command", "kill_process", "list_processes"]),
+  "上网": new Set(["fetch_url", "web_search", "browser_read"]),
+  "调取记忆": new Set(["search_memory", "recall_memory", "probe_memory", "upsert_memory", "merge_memories", "downgrade_memory"]),
+  "推送界面": new Set(["ui_show", "ui_update", "ui_hide", "ui_patch", "ui_register", "focus_banner"]),
+  "处理多媒体": new Set(["speak", "generate_lyrics", "generate_music", "generate_image", "music", "media_mode"]),
+  "回复用户": new Set(["send_message", "express"]),
+};
+const aiActivityLog = [];
+let aiActivityFirstTs = 0;
+let aiActivityTimer = null;
+const aiActivityEl = document.getElementById("ai-activity");
+const aiActivityLabelEl = document.getElementById("ai-activity-label");
+const aiActivityDetailEl = document.getElementById("ai-activity-detail");
+
+function classifyTool(name) {
+  for (const [label, set] of Object.entries(AI_TOOL_GROUPS)) {
+    if (set.has(name)) return label;
+  }
+  return "处理事务";
+}
+
+function recordAiActivity(name) {
+  if (!name) return;
+  const now = Date.now();
+  if (aiActivityLog.length === 0) aiActivityFirstTs = now;
+  aiActivityLog.push({ name, ts: now, group: classifyTool(name) });
+  refreshAiActivity();
+}
+
+function refreshAiActivity() {
+  if (!aiActivityEl) return;
+  const now = Date.now();
+  while (aiActivityLog.length && now - aiActivityLog[0].ts > AI_ACTIVITY_WINDOW_MS) {
+    aiActivityLog.shift();
+  }
+  if (aiActivityLog.length === 0) {
+    aiActivityEl.dataset.state = "idle";
+    aiActivityLabelEl.textContent = "空闲";
+    aiActivityDetailEl.textContent = "";
+    aiActivityFirstTs = 0;
+    return;
+  }
+  const lastTs = aiActivityLog[aiActivityLog.length - 1].ts;
+  if (now - lastTs > AI_ACTIVITY_IDLE_AFTER_MS) {
+    aiActivityEl.dataset.state = "idle";
+    aiActivityLabelEl.textContent = "刚完成";
+    const ago = Math.round((now - lastTs) / 1000);
+    aiActivityDetailEl.textContent = `${ago}s 前停止`;
+    return;
+  }
+  const counts = {};
+  for (const e of aiActivityLog) counts[e.group] = (counts[e.group] || 0) + 1;
+  let domGroup = "处理事务";
+  let domCount = 0;
+  for (const [g, c] of Object.entries(counts)) {
+    if (c > domCount) { domCount = c; domGroup = g; }
+  }
+  aiActivityEl.dataset.state = "busy";
+  aiActivityLabelEl.textContent = `正在${domGroup}`;
+  const elapsed = Math.round((now - (aiActivityFirstTs || lastTs)) / 1000);
+  aiActivityDetailEl.textContent = `· ${aiActivityLog.length} 次工具 · ${elapsed}s`;
+}
+
+if (aiActivityEl) {
+  aiActivityEl.dataset.state = "idle";
+  aiActivityTimer = setInterval(refreshAiActivity, 1000);
+}
+
+async function refreshMemoryAuditStats() {
+  if (!memRecallEl || !memExtractEl) return;
+  try {
+    const res = await fetch("/audit/stats?hours=1", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    const r = data?.recall || {};
+    const e = data?.extract || {};
+    const rTotal = Number(r.total || 0);
+    const rAvg = Number(r.avg_chosen || 0);
+    const rZero = Number(r.zero_match_count || 0);
+    const eTotal = Number(e.total || 0);
+    const eAvg = Number(e.avg_extracted || 0);
+    const eSkip = Number(e.skipped_count || 0);
+    memRecallEl.textContent = rTotal ? `${rTotal}·${rAvg.toFixed(1)}` : "0";
+    memExtractEl.textContent = eTotal ? `${eTotal}·${eAvg.toFixed(1)}` : "0";
+    memRecallEl.style.color = (rTotal > 0 && rZero / rTotal > 0.2) ? "var(--warn, #e8a23a)" : "";
+    memExtractEl.style.color = (eTotal > 0 && eSkip / eTotal > 0.5) ? "var(--warn, #e8a23a)" : "";
+  } catch {
+    // 静默：dev/build 早期 audit 表可能还没数据，保持 — 即可
+  }
+}
+refreshMemoryAuditStats();
+setInterval(refreshMemoryAuditStats, 60_000);
+
 function bumpTokens(text) {
   tokenAccum += (text || "").length / 3.4;
   const now = Date.now();
@@ -1188,6 +1296,7 @@ function handle({ type, data = {} }) {
     }
     case "tool_call":
       currentStream().tool(data.name, data.args, data.result, data.ok);
+      recordAiActivity(data.name);
       break;
     case "response":
       // Round complete — stop all animations

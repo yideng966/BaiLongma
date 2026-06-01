@@ -5,7 +5,7 @@ import net from 'net'
 import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
 import { pushMessage } from './queue.js'
-import { getDB, getConfig, setConfig, insertUISignal, upsertMediaHistory, getMediaHistory, updateLastJarvisConversationContent } from './db.js'
+import { getDB, getConfig, setConfig, insertUISignal, upsertMediaHistory, getMediaHistory, updateLastJarvisConversationContent, getRecentRecallAudits, getRecentExtractAudits, getRecallAuditStats, getExtractAuditStats } from './db.js'
 import { emitEvent, addSSEClient, removeSSEClient, addACUIClient, removeACUIClient, removeActiveUICard, emitUICommand, flushStickyEvents, setStickyEvent } from './events.js'
 import { getQuotaStatus } from './quota.js'
 import { isRunning, stopLoop, startLoop } from './control.js'
@@ -203,6 +203,11 @@ function getAgentName() {
   return (getConfig('agent_name') || '').trim() || DEFAULT_AGENT_NAME
 }
 
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback
+  try { return JSON.parse(value) } catch { return fallback }
+}
+
 function stripAssistantHistoryLabels(content) {
   return String(content || '')
     .trim()
@@ -327,6 +332,44 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         rows = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT ?').all(limit)
       }
       jsonResponse(res, 200, rows)
+      return
+    }
+
+    // GET /audit/recall?limit=50 — recent recall_audit rows (Memory-Optimization v0.1 Phase 0)
+    if (req.method === 'GET' && url.pathname === '/audit/recall') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 500)
+      const rows = getRecentRecallAudits(limit).map(r => ({
+        ...r,
+        matched_mem_ids: safeJsonParse(r.matched_mem_ids, []),
+        event_type_dist: safeJsonParse(r.event_type_dist, {}),
+      }))
+      jsonResponse(res, 200, rows)
+      return
+    }
+
+    // GET /audit/extract?limit=50 — recent extract_audit rows
+    if (req.method === 'GET' && url.pathname === '/audit/extract') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 500)
+      const rows = getRecentExtractAudits(limit).map(r => ({
+        ...r,
+        extracted_mem_ids: safeJsonParse(r.extracted_mem_ids, []),
+        event_type_dist: safeJsonParse(r.event_type_dist, {}),
+        skipped: !!r.skipped,
+      }))
+      jsonResponse(res, 200, rows)
+      return
+    }
+
+    // GET /audit/stats?hours=168 — aggregate over last N hours (default 7 days)
+    if (req.method === 'GET' && url.pathname === '/audit/stats') {
+      const hours = Math.max(1, Math.min(parseInt(url.searchParams.get('hours') || '168'), 24 * 30))
+      const sinceIso = new Date(Date.now() - hours * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+      jsonResponse(res, 200, {
+        windowHours: hours,
+        sinceIso,
+        recall: getRecallAuditStats({ sinceIso }) || {},
+        extract: getExtractAuditStats({ sinceIso }) || {},
+      })
       return
     }
 
@@ -1419,6 +1462,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     console.log(`[API]   POST /message  — send message to agent`)
     console.log(`[API]   GET  /events   — SSE real-time stream (receive agent messages)`)
     console.log(`[API]   GET  /memories — query memories`)
+    console.log(`[API]   GET  /audit/recall, /audit/extract, /audit/stats — memory observability (Phase 0)`)
     console.log(`[API]   GET  /status   — status`)
     console.log(`[API]   WS   /acui     — ACUI bidirectional channel (control + perception)`)
   })

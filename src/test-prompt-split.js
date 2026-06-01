@@ -137,4 +137,107 @@ assert(combined.endsWith(ctx1), 'preview ends with context part')
 // 7) Round-local context channel rule should be in the stable system
 assert(sys1.includes('Round-Local Context Channel'), 'system explains the <context> channel to the model')
 
+// =============================================================================
+// Wave 2: 场景规则段按需注入 gate
+// 默认 userMessage 为空 / 无信号位 → 8 段都不出现（除了 Platform Routing 的
+// "都不知道 → 走 CN 保守路径"分支，但 baseSystemArgs 也没传 country/timezone，
+// 它会触发该 fallback；其他 7 段不出现）。
+// =============================================================================
+
+// 8.0 Neutral baseline：无 userMessage + 无信号位 → CORE 段保留、场景段不出现
+const sysNeutral = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '你好' })
+assert(!sysNeutral.includes('Music Mode: Highest Priority'), 'neutral input: no Music Mode block')
+assert(!sysNeutral.includes('Video Mode: Reply Brevity'), 'neutral input: no Video Mode block')
+assert(!sysNeutral.includes('WeatherCard Rules'), 'neutral input: no WeatherCard Rules block')
+assert(!sysNeutral.includes('WeChat Connection'), 'neutral input: no WeChat Connection block')
+assert(!sysNeutral.includes('WeChat Outbound Constraint'), 'neutral input: no WeChat Outbound block')
+assert(!sysNeutral.includes('## Focus Banner'), 'neutral input: no Focus Banner block')
+assert(!sysNeutral.includes('## Security Sandbox'), 'neutral input: no Security Sandbox block')
+// Neutral baseline 仍保留 CORE：Top-Level、Response Rules、ACUI 主段、Voice 段
+assert(sysNeutral.includes('## Top-Level Behavior Rules'), 'neutral: CORE Top-Level kept')
+assert(sysNeutral.includes('## ACUI Visual Channel'), 'neutral: CORE ACUI main kept')
+assert(sysNeutral.includes('## Voice Input: Spoken Brevity'), 'neutral: CORE Voice kept')
+assert(sysNeutral.includes('### ui_show Rules'), 'neutral: CORE ui_show Rules kept')
+
+// 8.1 Music gate
+const sysMusic = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '放首周杰伦的歌' })
+assert(sysMusic.includes('Music Mode: Highest Priority'), 'music keyword: Music Mode injected')
+const sysMusic2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: 'play a song please' })
+assert(sysMusic2.includes('Music Mode: Highest Priority'), 'english "song": Music Mode injected')
+const sysMusic3 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '换一首' })
+assert(sysMusic3.includes('Music Mode: Highest Priority'), '"换一首": Music Mode injected')
+
+// 8.2 Video gate
+const sysVideo = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '帮我在B站看视频' })
+assert(sysVideo.includes('Video Mode: Reply Brevity'), 'video keyword: Video Mode injected')
+const sysVideo2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: 'open youtube' })
+assert(sysVideo2.includes('Video Mode: Reply Brevity'), 'youtube: Video Mode injected')
+
+// 8.3 WeatherCard gate
+const sysWeather = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '今天天气怎么样' })
+assert(sysWeather.includes('WeatherCard Rules'), 'weather keyword: WeatherCard Rules injected')
+assert(sysWeather.includes('wttr.in'), 'WeatherCard block contains wttr.in source line')
+const sysWeather2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: 'what about the weather' })
+assert(sysWeather2.includes('WeatherCard Rules'), 'english weather: WeatherCard Rules injected')
+
+// 8.4 WeChat Connection gate
+const sysWcConn = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '帮我连接微信' })
+assert(sysWcConn.includes('## WeChat Connection'), 'connect-wechat keyword: WeChat Connection injected')
+const sysWcConn2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: 'please connect WeChat for me' })
+assert(sysWcConn2.includes('## WeChat Connection'), 'english connect-wechat: injected')
+
+// 8.5 WeChat Outbound gate —— channel 状态触发，关键词不需要
+const sysWcOut = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '随便聊聊', currentChannel: 'WECHAT' })
+assert(sysWcOut.includes('WeChat Outbound Constraint'), 'channel=WECHAT: Outbound Constraint injected')
+const sysWcOut2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '随便聊聊', hasWechatHistory: true })
+assert(sysWcOut2.includes('WeChat Outbound Constraint'), 'hasWechatHistory: Outbound Constraint injected')
+const sysWcOut3 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '随便聊聊' })
+assert(!sysWcOut3.includes('WeChat Outbound Constraint'), 'no wechat signal: Outbound Constraint NOT injected')
+
+// 8.6 Focus Banner gate
+const sysFocus = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '帮我进入专注模式' })
+assert(sysFocus.includes('## Focus Banner'), 'focus keyword: Focus Banner injected')
+const sysFocus2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '吃了吗', hasActiveFocus: true })
+assert(sysFocus2.includes('## Focus Banner'), 'hasActiveFocus=true: Focus Banner injected even without keyword')
+const sysFocus3 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '吃了吗' })
+assert(!sysFocus3.includes('## Focus Banner'), 'no focus signal: Focus Banner NOT injected')
+
+// 8.7 Security Sandbox gate
+const sysSb = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '帮我解除沙箱限制' })
+assert(sysSb.includes('## Security Sandbox'), 'sandbox keyword: Security Sandbox injected')
+const sysSb2 = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: 'disable sandbox please' })
+assert(sysSb2.includes('## Security Sandbox'), 'english sandbox: Security Sandbox injected')
+
+// 8.8 Platform Routing gate
+const sysPlatCN = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '你好', currentCountryCode: 'CN' })
+assert(sysPlatCN.includes('## Platform Routing'), 'CN country: Platform Routing injected')
+const sysPlatTZ = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '你好', currentTimezone: 'Asia/Shanghai' })
+assert(sysPlatTZ.includes('## Platform Routing'), 'CN timezone: Platform Routing injected')
+const sysPlatUS = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '你好', currentCountryCode: 'US', currentTimezone: 'America/New_York' })
+assert(!sysPlatUS.includes('## Platform Routing'), 'US country+tz: Platform Routing NOT injected')
+// 保守 fallback：geo 都缺失 → 注入 CN 路径
+const sysPlatUnknown = buildSystemPrompt({ agentName: 'Longma', persona: 'p', userMessage: '你好' })
+assert(sysPlatUnknown.includes('## Platform Routing'), 'unknown geo: Platform Routing injected (default-to-CN)')
+
+// 8.9 CORE 永远在 —— 不论 gate 命中与否
+for (const s of [sysNeutral, sysMusic, sysVideo, sysWeather, sysWcConn, sysWcOut, sysFocus, sysSb, sysPlatCN, sysPlatUS]) {
+  assert(s.includes('## Relationship Posture'), 'CORE: Relationship Posture always present')
+  assert(s.includes('## Response Rules'), 'CORE: Response Rules always present')
+  assert(s.includes('## Self-Sufficient Execution'), 'CORE: Self-Sufficient Execution always present')
+  assert(s.includes('## ACUI Visual Channel'), 'CORE: ACUI Visual Channel always present')
+}
+
+// 8.10 Token 节省估算：neutral baseline vs full-injection
+const sysAllScenarios = buildSystemPrompt({
+  agentName: 'Longma',
+  persona: 'p',
+  userMessage: '放首歌 看视频 天气怎样 连接微信 专注模式 解除沙箱',
+  currentChannel: 'WECHAT',
+  hasActiveFocus: true,
+  currentCountryCode: 'CN',
+})
+console.log(`\n[wave2] neutral CN-fallback length: ${sysNeutral.length} chars`)
+console.log(`[wave2] all-scenarios injection length: ${sysAllScenarios.length} chars`)
+console.log(`[wave2] potential saving vs all-on: ${sysAllScenarios.length - sysNeutral.length} chars (~${Math.round((sysAllScenarios.length - sysNeutral.length) / 4)} tokens)`)
+
 console.log('\nAll prompt-split sanity checks complete.')

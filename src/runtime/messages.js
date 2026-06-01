@@ -164,7 +164,7 @@ function computeExpiredFollowupSet(rows, currentTopic) {
   return expired
 }
 
-export function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '', currentTopic = '' }) {
+export function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '', currentTopic = '', isTick = false }) {
   const messages = [{ role: 'system', content: systemPrompt }]
   messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps, batteryBlock }))
 
@@ -207,9 +207,16 @@ export function buildLLMMessages({ systemPrompt, contextBlock = '', conversation
   const hasCurrentMessage = currentMessageIndex >= 0
 
   if (!hasCurrentMessage) {
+    // TICK 心跳路径：fallback 消息会以 role:'user' 注入，结构上跟真用户消息没区别。
+    // 不加 marker 时模型会把 "TICK 2026-..." 当成用户在重新发问，于是反复回答自己上一轮
+    // 提的 open_question，出现自问自答。这里显式标 [heartbeat tick]、注明非用户消息、
+    // 禁止回放历史问题，与下面 system signal 的 marker 待遇对齐。
+    const fallbackContent = isTick
+      ? `[heartbeat tick · no new user message]\n${input}\n(This is an internal heartbeat, NOT a user message. Do NOT treat it as the user re-asking a prior question or responding to your previous open question. Decide whether to act proactively per the directions above, or stay silent — both are valid.)`
+      : input
     messages.push({
       role: 'user',
-      content: input,
+      content: fallbackContent,
     })
     currentMessageIndex = messages.length - 1
   }
