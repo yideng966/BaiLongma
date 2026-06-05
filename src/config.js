@@ -265,24 +265,45 @@ async function detectProvider(OpenAI, apiKey, requestedModel) {
   })
 }
 
-function readStoredConfig() {
+// 旧版本用过、之后被改名/合并的 provider id → 现行 id。
+// 作用：升级后老 config.json 里的旧 provider 名不会再让整份 LLM 配置作废（见下方分块容错加载），
+// 而是平滑映射到新名。目前无已知改名，留作扩展点——以后任何 provider 改名都往这里加一行。
+const LEGACY_PROVIDER_ALIASES = {
+  // 'oldName': MOONSHOT_PROVIDER,
+}
+
+function resolveProviderId(provider) {
+  const p = String(provider || '').trim()
+  if (p === 'custom' || PROVIDER_CONFIG[p]) return p
+  return LEGACY_PROVIDER_ALIASES[p] || p
+}
+
+// 只负责把 config.json 解析成对象；文件缺失或损坏才返回 null。
+// 不在这里判断 LLM 块是否可用——那是加载逻辑的事，避免"一个字段不合法就丢掉整份文件、
+// 连带把 voice/tts/security 等兄弟字段一起重置"（升级后最常见的"配置全没了"根因）。
+function readParsedConfig() {
   try {
     if (!fs.existsSync(paths.configFile)) return null
-    const raw = fs.readFileSync(paths.configFile, 'utf-8')
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object') return null
-    if (!parsed.provider) return null
-    if (parsed.provider === 'custom') {
-      if (!parsed.baseURL || typeof parsed.baseURL !== 'string') return null
-      if (!parsed.model || typeof parsed.model !== 'string') return null
-      return parsed
-    }
-    if (!PROVIDER_CONFIG[parsed.provider]) return null
-    if (!parsed.apiKey || typeof parsed.apiKey !== 'string') return null
-    return parsed
+    const parsed = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
+    return (parsed && typeof parsed === 'object') ? parsed : null
   } catch {
     return null
   }
+}
+
+// 判断 config.json 里的 LLM 块能否直接激活（provider/apiKey/custom 三件套齐全）。
+// 返回规整后的 { provider, apiKey, model, baseURL }（provider 已过别名映射）；不可用则返回 null。
+function resolveStoredLlm(parsed) {
+  if (!parsed || !parsed.provider) return null
+  const provider = resolveProviderId(parsed.provider)
+  if (provider === 'custom') {
+    if (typeof parsed.baseURL !== 'string' || !parsed.baseURL) return null
+    if (typeof parsed.model !== 'string' || !parsed.model) return null
+    return { provider, apiKey: parsed.apiKey, model: parsed.model, baseURL: parsed.baseURL }
+  }
+  if (!PROVIDER_CONFIG[provider]) return null
+  if (typeof parsed.apiKey !== 'string' || !parsed.apiKey) return null
+  return { provider, apiKey: parsed.apiKey, model: parsed.model, baseURL: parsed.baseURL }
 }
 
 function writeStoredConfig(obj) {
@@ -296,6 +317,15 @@ function writeStoredConfig(obj) {
 function readExistingStoredConfig() {
   try { return JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) || {} }
   catch { return {} }
+}
+
+// 顶级字段的"读-浅合并-写"一把梭。所有 setter 都该走它（或 readExistingStoredConfig），
+// 把"写时必合并、绝不全量覆盖"变成不可绕过的约束，杜绝再次出现"改一个字段抹掉其它块"。
+// 注意：浅合并无法删除键；需要删字段的 setter 仍自行 readExistingStoredConfig + 解构剔除后 writeStoredConfig。
+function patchConfig(partial) {
+  const merged = { ...readExistingStoredConfig(), ...partial }
+  writeStoredConfig(merged)
+  return merged
 }
 
 function shouldAllowEnvFallback() {
@@ -350,6 +380,52 @@ function applyConfig(provider, apiKey, model, customBaseURL) {
   config.needsActivation = false
 }
 
+// ── config.json schema 版本与迁移 ──
+// 仿 db.js 的迁移规范：config.json 带一个 schemaVersion 字段，启动时按版本号顺序跑迁移、
+// 跑完写回新版本号。把历史上零散、惰性触发的"一次性迁移"（如 seedance 拆分）收编到这里，
+// 让升级路径确定、可测、可追溯，而不是散落在各 getter 里。
+// 加新迁移：CONFIG_SCHEMA_VERSION 加 1，并在 CONFIG_MIGRATIONS 里补上对应版本号的函数。
+const CONFIG_SCHEMA_VERSION = 1
+
+// 每个迁移把传入的 config 对象升一级，返回新对象。允许带幂等副作用（如写独立文件）。
+const CONFIG_MIGRATIONS = {
+  // v0 → v1：把旧版塞在 config.json 里的 seedance 块拆到独立的 seedance.json，
+  // 并从主配置移除该字段。等价于 migrateLegacySeedance，收编为正式、确定性的启动迁移。
+  1(cfg) {
+    const legacy = cfg?.seedance
+    if (legacy && typeof legacy === 'object' && !fs.existsSync(paths.seedanceConfigFile)) {
+      // 失败则抛出 → runConfigMigrations 中止且不写回版本号，下次启动重试（原子语义）。
+      // 已存在 seedance.json 时跳过写入即可（幂等），剥离字段照常进行。
+      writeSeedanceFile(legacy)
+    }
+    const { seedance: _drop, ...rest } = cfg
+    return rest
+  },
+}
+
+// 启动时执行一次。文件缺失/损坏则跳过（无可迁移）；任一迁移抛错则中止且不写回，
+// 保留原文件，下次启动重试——宁可不迁，不可写坏。
+function runConfigMigrations() {
+  const parsed = readParsedConfig()
+  if (!parsed) return
+  const from = Number.isInteger(parsed.schemaVersion) ? parsed.schemaVersion : 0
+  if (from >= CONFIG_SCHEMA_VERSION) return
+  let cfg = parsed
+  for (let v = from + 1; v <= CONFIG_SCHEMA_VERSION; v++) {
+    const fn = CONFIG_MIGRATIONS[v]
+    if (!fn) continue
+    try { cfg = fn(cfg) || cfg }
+    catch (e) { console.warn(`[config] schema 迁移 v${v} 失败，已中止并保留原文件:`, e.message); return }
+  }
+  cfg.schemaVersion = CONFIG_SCHEMA_VERSION
+  try {
+    writeStoredConfig(cfg)
+    console.log(`[config] config.json schema 已从 v${from} 迁移到 v${CONFIG_SCHEMA_VERSION}`)
+  } catch (e) {
+    console.warn('[config] 写回迁移后的 config.json 失败:', e.message)
+  }
+}
+
 export const config = {
   tickInterval: 20 * 60 * 1000,
   provider: null,
@@ -366,17 +442,34 @@ export const config = {
   },
 }
 
-const stored = readStoredConfig()
-if (stored) {
-  applyConfig(stored.provider, stored.apiKey, stored.model, stored.baseURL)
-  if (typeof stored.temperature === 'number' && stored.temperature >= 0 && stored.temperature <= 2) {
-    config.temperature = stored.temperature
+// 迁移必须在下面读取/加载 config.json 之前跑完，确保后续逻辑看到的是已升级的结构。
+runConfigMigrations()
+
+// 加载顺序刻意分块容错：先无条件吃下 temperature / security 等"兄弟字段"，
+// 再单独判断 LLM 块能否激活。这样即便 LLM 块因 provider 改名/缺字段而不可用，
+// 也不会连带把沙盒开关、温度等其它配置一起重置——升级后最常见的"配置全没了"根因。
+const parsedConfig = readParsedConfig()
+if (parsedConfig) {
+  if (typeof parsedConfig.temperature === 'number' && parsedConfig.temperature >= 0 && parsedConfig.temperature <= 2) {
+    config.temperature = parsedConfig.temperature
   }
-  if (stored.security && typeof stored.security === 'object') {
-    if (typeof stored.security.fileSandbox === 'boolean') config.security.fileSandbox = stored.security.fileSandbox
-    if (typeof stored.security.execSandbox === 'boolean') config.security.execSandbox = stored.security.execSandbox
-    if (Array.isArray(stored.security.blockedTools)) config.security.blockedTools = stored.security.blockedTools
-    if (typeof stored.security.updatedAt === 'string') config.security.updatedAt = stored.security.updatedAt
+  if (parsedConfig.security && typeof parsedConfig.security === 'object') {
+    const s = parsedConfig.security
+    if (typeof s.fileSandbox === 'boolean') config.security.fileSandbox = s.fileSandbox
+    if (typeof s.execSandbox === 'boolean') config.security.execSandbox = s.execSandbox
+    if (Array.isArray(s.blockedTools)) config.security.blockedTools = s.blockedTools
+    if (typeof s.updatedAt === 'string') config.security.updatedAt = s.updatedAt
+  }
+}
+
+const storedLlm = resolveStoredLlm(parsedConfig)
+if (storedLlm) {
+  applyConfig(storedLlm.provider, storedLlm.apiKey, storedLlm.model, storedLlm.baseURL)
+  if (storedLlm.provider !== 'custom' && storedLlm.model) {
+    const normalized = normalizeModel(storedLlm.model, storedLlm.provider)
+    if (normalized !== storedLlm.model) {
+      console.warn(`[config] 已存模型 "${storedLlm.model}" 不在 ${storedLlm.provider} 当前列表，已回退到默认 "${normalized}"`)
+    }
   }
 } else if (shouldAllowEnvFallback()) {
   const fromEnv = loadFromEnv()
@@ -547,28 +640,19 @@ export function switchModel(model) {
     const trimmed = String(model || '').trim()
     if (!trimmed) throw new Error('Model name cannot be empty')
     config.model = trimmed
-    try {
-      const existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
-      writeStoredConfig({ ...existing, model: trimmed })
-    } catch {}
+    patchConfig({ model: trimmed })
     return { provider: 'custom', model: trimmed }
   }
   const normalized = normalizeModel(model, config.provider)
   config.model = normalized
-  try {
-    const existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
-    writeStoredConfig({ ...existing, model: normalized })
-  } catch {}
+  patchConfig({ model: normalized })
   return { provider: config.provider, model: normalized }
 }
 
 export function setTemperature(t) {
   const v = Math.min(2, Math.max(0, Number(t) || 0.5))
   config.temperature = v
-  try {
-    const existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
-    writeStoredConfig({ ...existing, temperature: v })
-  } catch {}
+  patchConfig({ temperature: v })
   return { temperature: v }
 }
 
@@ -592,10 +676,7 @@ export function setSecurity(updates) {
     || before.execSandbox !== config.security.execSandbox
     || JSON.stringify(before.blockedTools) !== JSON.stringify(config.security.blockedTools)
   if (changed) config.security.updatedAt = nowTimestamp()
-  try {
-    const existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
-    writeStoredConfig({ ...existing, security: { ...config.security } })
-  } catch {}
+  patchConfig({ security: { ...config.security } })
   return getSecurity()
 }
 
@@ -609,12 +690,10 @@ export function getMinimaxKey() {
 
 export function setMinimaxKey(key) {
   const trimmed = String(key || '').trim()
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
   if (trimmed) {
-    writeStoredConfig({ ...existing, minimax_api_key: trimmed })
+    patchConfig({ minimax_api_key: trimmed })
   } else {
-    const { minimax_api_key: _removed, ...rest } = existing
+    const { minimax_api_key: _removed, ...rest } = readExistingStoredConfig()
     writeStoredConfig(rest)
   }
 }
@@ -708,15 +787,11 @@ export function getClawbotCredentials() {
 }
 
 export function setClawbotCredentials({ accountId, botToken, baseUrl }) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
-  writeStoredConfig({ ...existing, clawbot: { accountId, botToken, baseUrl } })
+  patchConfig({ clawbot: { accountId, botToken, baseUrl } })
 }
 
 export function clearClawbotCredentials() {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
-  const { clawbot: _, ...rest } = existing
+  const { clawbot: _, ...rest } = readExistingStoredConfig()
   writeStoredConfig(rest)
 }
 
@@ -732,8 +807,7 @@ export function getSocialConfig() {
 }
 
 export function setSocialConfig(updates) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
+  const existing = readExistingStoredConfig()
   const current = existing.social || {}
   const next = { ...current }
   for (const [key, val] of Object.entries(updates)) {
@@ -789,8 +863,7 @@ export function getVoiceConfig() {
 }
 
 export function setVoiceConfig(updates) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
+  const existing = readExistingStoredConfig()
   const current = existing.voice || {}
   const next = { ...current }
   for (const [key, val] of Object.entries(updates)) {
@@ -870,8 +943,7 @@ export function getTTSCredentials() {
 }
 
 export function setTTSConfig(updates) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
+  const existing = readExistingStoredConfig()
   const current = existing.tts || {}
   const next = { ...current }
   for (const [key, val] of Object.entries(updates)) {
@@ -964,8 +1036,7 @@ export function getEmbeddingCredentials() {
 }
 
 export function setEmbeddingConfig(updates) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
+  const existing = readExistingStoredConfig()
   const current = existing.embedding || {}
   const next = { ...current }
   for (const [key, val] of Object.entries(updates || {})) {
@@ -1049,8 +1120,7 @@ export function getWebSearchCredentials() {
 }
 
 export function setWebSearchConfig(updates) {
-  let existing = {}
-  try { existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch {}
+  const existing = readExistingStoredConfig()
   const next = { ...existing }
   for (const [key, val] of Object.entries(updates || {})) {
     const cfgField = WEB_SEARCH_KEY_MAP[key]
