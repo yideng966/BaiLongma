@@ -14,6 +14,13 @@ import path from 'path'
 import { paths } from './paths.js'
 
 const ZHIBO8_URL = 'https://www.zhibo8.cc/'
+// 比分接口：直播吧前端自己用的 qiumibao JSON（首页静态 HTML 里比分永远是"-"占位，
+// 由浏览器 JS 动态填充，所以必须单独拉这个接口）。免签名、大陆直连。
+// 不带日期 = 当天全部比赛；带日期可回填往日终场比分。
+const BIFEN_BASE = 'https://bifen4pc.qiumibao.com/json'
+// 事件流/比赛时钟（同为直播吧前端数据源）：进球/黄牌/换人事件带球员中文名，
+// high_speed 给真实比赛分钟（period_cn 如 "55'"）——墙钟估算含中场休息会虚高
+const DC_BASE = 'https://dc4pc.qiumibao.com/dc/matchs/data'
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 const FETCH_TIMEOUT_MS = 15000
 
@@ -195,6 +202,170 @@ export function parseWorldcupNews(html = '', limit = 12) {
   return out
 }
 
+// ── qiumibao 比分合并（2026-06-12 揭幕战实测：比分只能从这里拿，静态 HTML 没有） ──
+
+// state 含义（实测批量接口）：1=未赛 2=进行中 3=完赛 4=延期 7=待定
+const BIFEN_STATUS = { 1: 'scheduled', 2: 'live', 3: 'finished' }
+
+function parseScorers(playerData) {
+  if (!Array.isArray(playerData)) return []
+  const out = []
+  for (const p of playerData) {
+    const min = parseInt(String(p?.value || ''), 10) // "9'" / "45+2'" → 9 / 45
+    if (p?.player_name && Number.isFinite(min)) out.push({ min, name: p.player_name })
+  }
+  return out
+}
+
+// 把比分接口的行合并进比赛对象（原地改写）；返回是否有变化。
+// 注意：state=1（未赛）时 left/right.score 是 "0"/"0" 占位，不能当真实 0-0 采纳。
+export function applyScoreRows(matches = [], rows = []) {
+  const byId = new Map()
+  for (const row of rows) {
+    if (row?.id != null) byId.set(String(row.id), row)
+  }
+  let changed = false
+  for (const match of matches) {
+    const row = byId.get(String(match.matchId))
+    if (!row) continue
+    const status = BIFEN_STATUS[String(row.state)]
+    if (!status) continue // 延期/待定等留给首页启发式
+    const before = JSON.stringify([match.status, match.score, match.scorersHome, match.scorersAway])
+    match.status = status
+    if (status === 'live' || status === 'finished') {
+      const home = Number(row.left?.score)
+      const away = Number(row.right?.score)
+      // 接口的 left/right 即首页展示的左/右，与解析出的 home/away 同向（实测揭幕战核对）
+      if (row.left?.score !== '' && row.right?.score !== '' && Number.isFinite(home) && Number.isFinite(away)) {
+        match.score = { home, away }
+      }
+      const scorersHome = parseScorers(row.left?.player_data)
+      const scorersAway = parseScorers(row.right?.player_data)
+      if (scorersHome.length) match.scorersHome = scorersHome
+      if (scorersAway.length) match.scorersAway = scorersAway
+    }
+    if (JSON.stringify([match.status, match.score, match.scorersHome, match.scorersAway]) !== before) changed = true
+  }
+  return changed
+}
+
+// 事件流行 → 面板事件对象；homeTeamId/awayTeamId 来自 high_speed，定哪侧的事件。
+// is_hide 的行是被折叠进主事件的从属行（如进球行自带 sub 助攻，独立助攻行标 is_hide）。
+export function parseMatchEvents(rows = [], { homeTeamId = '', awayTeamId = '' } = {}) {
+  if (!Array.isArray(rows)) return []
+  const out = []
+  for (const row of rows) {
+    if (!row || row.is_hide) continue
+    const min = parseInt(String(row.time || ''), 10)
+    const type = String(row.event_code_cn || '').trim()
+    if (!Number.isFinite(min) || !type) continue
+    const teamId = String(row.sl_team_id || '')
+    const event = {
+      min,
+      type,
+      name: String(row.player_name_cn || '').trim(),
+      side: teamId && teamId === String(homeTeamId) ? 'home'
+        : teamId && teamId === String(awayTeamId) ? 'away' : null,
+    }
+    const assist = row.sub?.player_name_cn
+    if (assist && /助攻/.test(String(row.sub.event_code_cn || ''))) event.assist = String(assist).trim()
+    out.push(event)
+  }
+  return out.sort((a, b) => a.min - b.min)
+}
+
+async function fetchDcJson(kind, date, matchId) {
+  try {
+    const res = await fetch(`${DC_BASE}/${date}/${kind}_${matchId}.htm`, {
+      headers: { 'User-Agent': USER_AGENT, Referer: 'https://www.zhibo8.cc/' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await res.json()
+  } catch (err) {
+    console.warn(`[Worldcup] ${kind} 接口失败(${matchId}):`, err.message)
+    return null
+  }
+}
+
+// live 场次的事件流+真实比赛时钟；完场后保留最后一次抓到的事件（焦点区回看赛果用）
+const LIVE_DETAIL_MAX = 4 // 世界杯同时开球最多 4 场，防御性上限
+
+async function refreshLiveDetails() {
+  loadStoreOnce()
+  const live = [...matchStore.values()].filter(m => m.status === 'live').slice(0, LIVE_DETAIL_MAX)
+  if (!live.length) return
+  let changed = false
+  for (const match of live) {
+    const date = String(match.time || '').slice(0, 10)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue
+    const [hs, ev] = await Promise.all([
+      fetchDcJson('match_high_speed', date, match.matchId),
+      fetchDcJson('match_event', date, match.matchId),
+    ])
+    const before = JSON.stringify([match.clock, match.events, match.teamIds])
+    if (hs?.data?.period_cn) {
+      match.clock = { periodCn: hs.data.period_cn, stoppage: Number(hs.data.stoppage) || 0 }
+      if (hs.data.Team1Id) match.teamIds = { home: String(hs.data.Team1Id), away: String(hs.data.Team2Id || '') }
+    }
+    if (Array.isArray(ev?.data)) {
+      const events = parseMatchEvents(ev.data, {
+        homeTeamId: match.teamIds?.home, awayTeamId: match.teamIds?.away,
+      })
+      if (events.length || match.events) match.events = events
+    }
+    if (JSON.stringify([match.clock, match.events, match.teamIds]) !== before) changed = true
+  }
+  if (changed) saveStore()
+}
+
+async function fetchScoreRows(date = null) {
+  const url = date ? `${BIFEN_BASE}/${date}/v2/list.htm` : `${BIFEN_BASE}/v2/list.htm`
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT, Referer: 'https://www.zhibo8.cc/' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    return Array.isArray(data?.list) ? data.list : []
+  } catch (err) {
+    console.warn(`[Worldcup] 比分接口失败(${date || '今日'}):`, err.message)
+    return null // 比分拿不到不致命，赛程照常展示
+  }
+}
+
+function localDateStr(ms) {
+  const d = new Date(ms)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+// 每个往日最多回填这么多天，避免长期停机后一次刷新打太多请求
+const BACKFILL_DATES_PER_REFRESH = 3
+
+async function refreshScores(now = Date.now()) {
+  loadStoreOnce()
+  const all = [...matchStore.values()]
+  if (!all.length) return
+  let changed = false
+  const todayRows = await fetchScoreRows()
+  if (todayRows) changed = applyScoreRows(all, todayRows) || changed
+  // 回填：已开赛却始终没比分的往日场次（应用当天没开机就会漏终场比分）
+  const today = localDateStr(now)
+  const missingDates = [...new Set(
+    all
+      .filter(m => m.startMs != null && now >= m.startMs + LIVE_WINDOW_MS && !m.score)
+      .map(m => String(m.time || '').slice(0, 10))
+      .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d) && d !== today)
+  )].slice(0, BACKFILL_DATES_PER_REFRESH)
+  for (const date of missingDates) {
+    const rows = await fetchScoreRows(date)
+    if (rows) changed = applyScoreRows(all, rows) || changed
+  }
+  if (changed) saveStore()
+}
+
 // ── 比赛持久化存储（首页条目会滚动消失，累积合并才能算整届积分榜） ─────────────
 
 function loadStoreOnce() {
@@ -237,6 +408,8 @@ function mergeIntoStore(matches = []) {
       ...match,
       score: match.score || prev.score || null,
     }
+    // 完场也只进不退：比分接口定下的 finished 不被首页 150 分钟启发式打回 live/unknown
+    if (prev.status === 'finished') merged.status = 'finished'
     if (merged.score && merged.status !== 'live') merged.status = 'finished'
     if (JSON.stringify(merged) !== JSON.stringify(prev)) {
       matchStore.set(match.matchId, merged)
@@ -319,6 +492,8 @@ async function fetchWorldcup() {
   }
 
   mergeIntoStore(parsed)
+  await refreshScores() // 真实比分/状态来自 qiumibao 接口，覆盖首页启发式
+  await refreshLiveDetails() // live 场次再补事件流+真实比赛时钟
   const matches = getStoredMatches()
   const fetchedAt = new Date()
   return {

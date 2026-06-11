@@ -5,7 +5,7 @@
   数据策略（2026-06-11 起）：
   - 真数据（来自 /worldcup ← 直播吧解析）：焦点比赛、今日/近期赛程、比分与状态、
     小组积分榜、近期赛果、世界杯新闻快讯、数据更新时间
-  - 演示数据（暂无数据源，面板标"演示数据"）：技术统计条、实时事件轴、晋级概率
+  - 演示数据（暂无数据源，面板标"演示数据"）：技术统计条（实时事件已接真数据；晋级概率已移除）
     （这三块等比赛详情页解析落地后接真）
   - 取数顺序：主应用 localhost:3721 → dev 服务器 localhost:3722（node src/worldcup-dev-server.js）
     → 都失败则整页演示数据并顶部提示
@@ -242,7 +242,7 @@
   .sched-vs .vs { font-family: var(--num); font-size: 16px; color: var(--ink-2); text-align: center; white-space: nowrap; }
   .sched-vs .vs.score { font-size: 21px; font-weight: 700; color: #fff; }
 
-  /* ── 下排：实时事件（演示） ── */
+  /* ── 下排：实时事件 ── */
   .events-strip { flex: 1; display: flex; align-items: stretch; padding: 8px 6px 4px; min-height: 0; }
   .event-cell { flex: 1; min-width: 0; padding: 6px 14px; display: flex; flex-direction: column; justify-content: center; gap: 5px; }
   .event-cell + .event-cell { border-left: 1px solid rgba(80, 110, 200, 0.3); }
@@ -251,17 +251,9 @@
   .event-main.goal { color: #6aa8ff; }
   .event-sub { font-size: 12.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ico-yellow { width: 13px; height: 17px; border-radius: 2.5px; background: linear-gradient(160deg, #ffd84d, #e0a800); box-shadow: 0 0 6px rgba(255, 216, 77, 0.5); flex: none; }
+  .ico-red { width: 13px; height: 17px; border-radius: 2.5px; background: linear-gradient(160deg, #ff6a6a, #c01730); box-shadow: 0 0 6px rgba(255, 90, 90, 0.5); flex: none; }
   .ico-sub { font-size: 16px; font-weight: 900; flex: none; line-height: 1; }
   .ico-sub .in { color: #3ddc7d; } .ico-sub .out { color: #ff5a5a; }
-  .prob-bar-row { flex: none; display: flex; align-items: center; gap: 16px; padding: 10px 20px 14px; border-top: 1px solid rgba(64, 140, 255, 0.22); }
-  .prob-label { font-size: 15px; font-weight: 700; color: var(--gold); white-space: nowrap; }
-  .prob-side { font-size: 14.5px; white-space: nowrap; }
-  .prob-side b { font-family: var(--num); font-size: 19px; margin-left: 6px; }
-  .prob-side.l b { color: var(--blue-bar); }
-  .prob-side.r, .prob-side.r b { color: var(--live); }
-  .prob-track { flex: 1; height: 14px; border-radius: 8px; overflow: hidden; display: flex; background: rgba(30, 45, 110, 0.8); }
-  .prob-track .pl { background: linear-gradient(90deg, #1e5fd8, #4a8eff); box-shadow: 0 0 12px var(--neon-soft); }
-  .prob-track .pr { background: linear-gradient(90deg, #c01730, var(--live)); flex: 1; }
 
   /* ── 下排右：近期赛果 / 即将开赛（真） ── */
   .res-list { flex: 1; display: flex; flex-direction: column; justify-content: space-evenly; padding: 6px 18px 2px; min-height: 0; }
@@ -386,9 +378,8 @@
 
     <div class="row2">
       <div class="panel boot-item" style="--boot-delay:560ms;--exit-delay:80ms">
-        <div class="panel-head">实时事件 <span class="aux" id="events-aux"></span><span class="demo-tag">演示数据</span></div>
+        <div class="panel-head">实时事件 <span class="aux" id="events-aux"></span><span class="demo-tag" id="events-demo-tag">演示数据</span></div>
         <div class="events-strip" id="events-strip"></div>
-        <div class="prob-bar-row" id="prob-row"></div>
       </div>
 
       <div class="panel boot-item" style="--boot-delay:660ms;--exit-delay:40ms">
@@ -471,7 +462,7 @@ const DEMO = {
   ],
 };
 
-// 实时事件轴目前没有数据源（待比赛详情页解析落地），两种模式下都是演示样式
+// 实时事件演示数据（仅后端不可达时使用；真数据走 match.events）
 const DEMO_EVENTS = [
   { min: 67, type: 'save', main: '梅西 射门被扑出', sub: '' },
   { min: 65, type: 'yellow', main: '法国 获得黄牌', sub: '格列兹曼' },
@@ -575,7 +566,13 @@ function tickHeroClock() {
     el.textContent = `${Math.floor(demoHeroSec / 60)}:${pad(demoHeroSec % 60)}`;
     return;
   }
-  if (focus.status === 'live' && focus.startMs) {
+  if (focus.status === 'live' && focus.clock?.periodCn) {
+    // 真实比赛分钟（qiumibao high_speed，随后端 2 分钟刷新）；墙钟估算含中场休息会虚高
+    // 补时只在半场末尾（45'/90'/105'/120'）展示，赛中挂着 +4' 会误导
+    const stop = focus.clock.stoppage && /^(45|90|105|120)\D/.test(focus.clock.periodCn)
+      ? ` +${focus.clock.stoppage}'` : '';
+    el.textContent = `${focus.clock.periodCn}${stop}`;
+  } else if (focus.status === 'live' && focus.startMs) {
     el.textContent = `已开球 ${Math.max(0, Math.floor((Date.now() - focus.startMs) / 60000))} 分钟`;
   } else if (focus.status === 'scheduled' && focus.startMs) {
     el.textContent = countdown(focus.startMs);
@@ -709,26 +706,66 @@ function renderBottomRight(vm) {
   }).join('');
 }
 
-// ═══ 渲染：实时事件（演示样式，数据源待详情页解析） + 新闻 ═══════════════════════
+// ═══ 渲染：实时事件（真数据：qiumibao match_event，经 /worldcup 的 match.events） + 新闻 ═══
+
+function eventIcon(kind) {
+  if (kind === 'yellow') return '<span class="ico-yellow"></span>';
+  if (kind === 'red') return '<span class="ico-red"></span>';
+  if (kind === 'sub') return '<span class="ico-sub"><span class="in">⬆</span><span class="out">⬇</span></span>';
+  return '<span class="ball"></span>';
+}
+
+// 后端事件 {min,type(中文),name,side,assist?} → 单元格视图
+function eventCell(e, focus) {
+  const team = e.side === 'home' ? focus.home : (e.side === 'away' ? focus.away : '');
+  let kind = 'other', main, sub = '';
+  if (/进球|点球|乌龙/.test(e.type)) {
+    kind = 'goal';
+    main = `${e.name || team} ${e.type}！`;
+    sub = e.assist ? `${e.assist} 助攻` : team;
+  } else if (/黄牌/.test(e.type)) {
+    kind = 'yellow';
+    main = team ? `${team} 获得黄牌` : `${e.name} 黄牌`;
+    sub = team ? e.name : '';
+  } else if (/红牌/.test(e.type)) {
+    kind = 'red';
+    main = team ? `${team} 获得红牌` : `${e.name} 红牌`;
+    sub = team ? e.name : '';
+  } else if (/换人|换下/.test(e.type)) {
+    kind = 'sub';
+    main = team ? `${team} 换人` : '换人';
+    sub = e.name;
+  } else {
+    main = e.name ? `${e.name} ${e.type}` : e.type;
+    sub = team;
+  }
+  return `
+    <div class="event-cell">
+      <div class="event-top">${eventIcon(kind)} ${e.min}'</div>
+      <div class="event-main ${kind === 'goal' ? 'goal' : ''}">${main}</div>
+      ${sub ? `<div class="event-sub">${sub}</div>` : ''}
+    </div>`;
+}
 
 function renderEvents() {
-  const icon = (t) => {
-    if (t === 'yellow') return '<span class="ico-yellow"></span>';
-    if (t === 'sub') return '<span class="ico-sub"><span class="in">⬆</span><span class="out">⬇</span></span>';
-    return '<span class="ball"></span>';
-  };
-  $('events-aux').textContent = MODE === 'real' ? '样式预览 · 详情页数据待接入' : '';
+  if (MODE === 'real') {
+    $('events-demo-tag').style.display = 'none';
+    const focus = VM?.focus;
+    const events = (focus?.events || []).slice(-6).reverse(); // 最新在左
+    $('events-aux').textContent = events.length ? `${focus.home} vs ${focus.away}` : '';
+    $('events-strip').innerHTML = events.length
+      ? events.map((e) => eventCell(e, focus)).join('')
+      : '<div class="empty-note">焦点比赛开赛后自动生成</div>';
+    return;
+  }
+  $('events-demo-tag').style.display = '';
+  $('events-aux').textContent = '';
   $('events-strip').innerHTML = DEMO_EVENTS.map((e) => `
     <div class="event-cell">
-      <div class="event-top">${icon(e.type)} ${e.min}'</div>
+      <div class="event-top">${eventIcon(e.type)} ${e.min}'</div>
       <div class="event-main ${e.type === 'goal' ? 'goal' : ''}">${e.main}</div>
       ${e.sub ? `<div class="event-sub">${e.sub}</div>` : ''}
     </div>`).join('');
-  $('prob-row').innerHTML = `
-    <span class="prob-label">实时晋级概率</span>
-    <span class="prob-side l">阿根廷晋级<b>78%</b></span>
-    <span class="prob-track"><span class="pl" style="width:78%"></span><span class="pr"></span></span>
-    <span class="prob-side r">法国晋级<b>22%</b></span>`;
 }
 
 function renderNews(items) {
