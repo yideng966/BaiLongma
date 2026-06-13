@@ -19,7 +19,7 @@ const SUMMARY_TEMPERATURE = 0.2
 const SUMMARY_PROMPT = `You are the thread summarizer. Compress the following conversation excerpt and tool-call log into a 1-2 sentence incremental conclusion for this thread.
 Requirements:
 - Narrate in the first person ("我..."), where "我" is *you, the assistant* — never the user.
-- The excerpt lines are labeled "<sender> -> <receiver>". Attribute correctly: never absorb the user's statements, suggestions, or emotions as your own thought or decision. If a choice or proposal came from the user, say so explicitly (e.g. "用户提议…，我…").
+- The excerpt lines are labeled "<sender> -> <receiver>". Attribution is decided by this label, never by the pronouns inside a line. It runs BOTH ways: (a) never absorb the user's statements, suggestions, or emotions as your own thought or decision — if a choice or proposal came from the user, say so ("用户提议…，我…"); (b) just as strictly, never hand YOUR own guesses, predictions, choices, or commitments to the user — a score you yourself called, a plan you proposed, an option you picked all sit on "You -> ..." lines and stay yours ("我押了…", NOT "用户押了…"). When the same topic has both sides making guesses/choices, slow down and read the label before you write whose it was.
 - If a previous summary is given, your conclusion covers only what happened AFTER it — do not restate the previous summary.
 - Capture what got done, what decisions were made (and by whom), and what concrete artifacts were left behind. If work is still in progress, say where it stands.
 - No bullet points, no play-by-play. Give the conclusion itself directly, with no prefix.

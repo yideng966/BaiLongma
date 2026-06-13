@@ -24,9 +24,17 @@ export function formatConversationMessage(row, currentMsg = null, prevChannel = 
     //   不像 user 那种 [user message · ...] 包裹，因为我们要保留 assistant role 的常规结构。
     const tt = (row?.focus_topic || '').trim()
     const topicPrefix = tt ? `[topic=${tt}] ` : ''
+    // 归属对称：用户每条消息都带响亮的 [user message · from_id · ts] 带内头，自报说话人；
+    //   而 jarvis 历史消息原本只靠 role:'assistant' 这个结构字段标身份，正文里没有可见锚点。
+    //   当窗口里同时存在"用户说的"和"我说的"同类内容（典型：双方都在猜世界杯比分），
+    //   含糊的归属会被用户那侧响亮的标签拉过去——我自己几轮前押的 2-0 被错记成"你猜的 2-0"。
+    //   2026-06-07 的 [↑ your last reply] 只覆盖紧邻的上一条；这里给"每一条"我的历史消息
+    //   补一个对称的 [you · ts] 带内头，让跨整个窗口的归属都有可见锚，不只最后一条。
+    const jts = row.timestamp ? row.timestamp.slice(0, 16).replace('T', ' ') : ''
+    const youTag = jts ? `[you · ${jts}]\n` : `[you]\n`
     return {
       role: 'assistant',
-      content: `${channelTag}${topicPrefix}${row.content || ''}${expiredTag}`,
+      content: `${youTag}${channelTag}${topicPrefix}${row.content || ''}${expiredTag}`,
     }
   }
 

@@ -428,8 +428,10 @@ const sim = MEMORY_GRAPH_ENABLED
     .force("radial", d3.forceRadial(180, W / 2, H / 2 - 10))
     .force("collision", d3.forceCollide())
     .alphaDecay(0.028)
+    .alphaMin(0.02) // 肉眼已静止后别再空烧 GPU（默认 0.001 要多跑约 2 秒）
     .velocityDecay(0.3)
     .on("tick", tick)
+    .on("end", writeGraphDom)
   : null;
 
 function linkDistance(link) {
@@ -546,7 +548,7 @@ function dampTangentialMotion() {
   });
 }
 
-function naturalTwitch() {
+function naturalTwitch(big = Math.random() < 0.3) {
   if (!MEMORY_GRAPH_ENABLED || !sim) return;
   if (nodeData.length < 2) {
     sim.alpha(1).restart();
@@ -564,7 +566,9 @@ function naturalTwitch() {
     }
   });
 
-  const twitchCount = Math.max(6, Math.floor(nodeData.length * 0.3));
+  // 小抽动（常态）只动少数节点低热度；大波（偶发）才整片涌动
+  const ratio = big ? 0.3 : 0.1;
+  const twitchCount = Math.max(big ? 6 : 3, Math.floor(nodeData.length * ratio));
   const candidates = shuffleArray(nodeData.filter(node => !node._core)).slice(0, twitchCount);
 
   candidates.forEach(node => {
@@ -586,12 +590,21 @@ function naturalTwitch() {
     node.vy = (node.vy || 0) + (nextY - currentY) * 0.14;
   });
 
-  sim.alpha(0.85).restart();
+  sim.alpha(big ? 0.6 : 0.35).restart();
 }
 
+let tickParity = 0;
 function tick() {
   if (!MEMORY_GRAPH_ENABLED) return;
   dampTangentialMotion();
+  // 非拖拽时 DOM 写入降到 30fps：力计算照跑，重绘减半；拖拽（alphaTarget>0）保持满帧
+  tickParity ^= 1;
+  if (tickParity && sim.alphaTarget() === 0) return;
+  writeGraphDom();
+}
+
+function writeGraphDom() {
+  if (!MEMORY_GRAPH_ENABLED || !linkSel || !nodeSel) return;
 
   linkSel
     .attr("x1", d => d.source.x)
@@ -959,7 +972,17 @@ function addNewNodes(memories) {
 }
 
 if (MEMORY_GRAPH_ENABLED) {
-  setInterval(() => naturalTwitch(), 6000);
+  // 随机 5–9 秒一次抽动，比固定节拍更像活物；窗口不可见时休眠省 GPU
+  const scheduleTwitch = () => {
+    setTimeout(() => {
+      if (!document.hidden) naturalTwitch();
+      scheduleTwitch();
+    }, 5000 + Math.random() * 4000);
+  };
+  scheduleTwitch();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) naturalTwitch(true); // 回到前台来一发大波当欢迎
+  });
   setInterval(() => { nodeData.forEach(n => { if (n._strength) n._strength *= 0.97; }); }, 2500);
 }
 

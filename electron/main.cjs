@@ -75,17 +75,21 @@ process.on('uncaughtException', (err) => {
 console.log(`[main] Bailongma ${app.getVersion()} starting, logs → ${LOG_FILE}`)
 
 // ── GPU 适配器偏好（Windows 多显卡：核显 + 独显笔记本） ──
-// Chromium 默认被 Windows 分配到「省电 GPU」（核显），独显闲置、核显被点阵球/大屏
-// 渲染拉满。Windows 的逐应用显卡偏好存在 HKCU\...\DirectX\UserGpuPreferences
-// （与系统设置→屏幕→显示卡的逐应用选项同源），这里替自己的 exe 写一条：
-//   2=高性能（独显优先，默认）  1=省电（核显）  删除=跟随系统
-// config.json 顶级字段 gpuPreference 可改：'discrete' | 'integrated' | 'system'。
-// 单显卡机器上写 2 无副作用（没有第二块卡可选）。该键在 GPU 进程创建 D3D 设备时
-// 读取——这里在启动最早期同步写入，但首次写入仍可能晚于 GPU 进程拉起，
-// 此时要到下次启动才真正切换适配器。
+// Windows 的逐应用显卡偏好存在 HKCU\...\DirectX\UserGpuPreferences
+// （与系统设置→屏幕→显示卡的逐应用选项同源），这里按 config 替自己的 exe 维护一条：
+//   'discrete'=2 高性能（独显） 'integrated'=1 省电（核显） 'system'=删除条目跟随系统（默认）
+// config.json 顶级字段 gpuPreference 可改。
+//
+// 默认跟随系统（= Optimus 上落核显）是实测出来的：v2.1.399 试过默认独显优先，
+// MX450 上 3D 只占 9% 却另付 10% 的 copy 引擎过路费——屏幕物理接在核显上，
+// 独显画完每帧都要拷回核显显示；且只要有持续动画独显就永远无法断电休眠，
+// 薄本上常驻 77°C。点阵球节流/抽稀之后渲染负载核显随手就能扛，独显得不偿失。
+// 'discrete' 留作大屏/高分辨率重负载场景的手动开关。
+// 该键在 GPU 进程创建 D3D 设备时读取——这里在启动最早期同步写入，
+// 但首次变更仍可能晚于 GPU 进程拉起，此时要到下次启动才真正切换适配器。
 function applyGpuPreference() {
   if (process.platform !== 'win32') return
-  let pref = 'discrete'
+  let pref = 'system'
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(USER_DIR, 'config.json'), 'utf-8'))
     if (['discrete', 'integrated', 'system'].includes(cfg?.gpuPreference)) pref = cfg.gpuPreference

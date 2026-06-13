@@ -99,6 +99,7 @@ const assistant = messages.find(m => m.role === 'assistant')
 // it carries the salience anchor tag, then the verbatim original content.
 assert(assistant.content.includes('我看到了，随时为您效劳！'), 'assistant history content preserved verbatim')
 assert(assistant.content.includes('your last reply'), 'last reply is tagged as the salience anchor')
+assert(assistant.content.includes('[you · '), 'assistant line carries the symmetric in-band speaker heading')
 assert(assistant.content.endsWith('我看到了，随时为您效劳！'), 'tag is prepended, original content kept verbatim at the end')
 
 const fallbackMessages = buildLLMMessages({
